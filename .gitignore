@@ -1,0 +1,50 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.pyright/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Coverage and test outputs
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit.xml
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# IDE and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
+
+# Local SQLite databases and journals
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Keep intentional fixture regeneration scripts and docs trackable.

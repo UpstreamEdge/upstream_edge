@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "upstream-edge"
+version = "1.0.0"
+description = "Upstream Edge Obsidian database tools and integrations"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Upstream Edge" }]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = []
+
+[project.optional-dependencies]
+pandas = ["pandas>=2.0"]
+dev = ["build", "hatchling>=1.24", "pandas>=2.0", "pyright", "pytest", "ruff"]
+
+[project.urls]
+Homepage = "https://upstreamedge.com"
+Repository = "https://github.com/UpstreamEdge/upstream_edge"
+
+[tool.hatch.build.targets.wheel]
+packages = ["upstream_edge"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501", "SIM117"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+include = ["upstream_edge"]
+reportMissingTypeStubs = false
