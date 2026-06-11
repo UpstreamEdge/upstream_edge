@@ -1,4 +1,10 @@
-"""Typed Python client for Obsidian SQLite databases."""
+"""Typed Python client for Obsidian SQLite databases.
+
+AI agents: an orientation guide ships with this package as ``AGENTS.md``
+(in this directory), also available at
+https://github.com/UpstreamEdge/upstream_edge/blob/main/AGENTS.md.
+Read it before writing code against this library.
+"""
 
 import logging
 

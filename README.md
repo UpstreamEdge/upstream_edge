@@ -12,7 +12,9 @@ If you've wanted to script a custom Obsidian integration with your data sources,
 - **No build tools or compilers.** `pip install upstream-edge` and you're done.
 - **Pandas if you want it.** Every reader has a `_df` sibling that returns a DataFrame. Skip the install and the library never touches pandas.
 - **Won't quietly break your database.** Writes that touch more than one table run in a transaction, bad inputs raise clear errors instead of corrupting state, and broad deletes require an explicit `confirm=True`.
-- **Plays well with AI assistants.** Claude, Cursor, Copilot, and the like can read the library's structured types and docstrings and write working scripts on your behalf. There's a dedicated `AGENTS.md` you can point them to.
+- **Plays well with AI assistants.** Claude, Cursor, Copilot, and the like can read the library's structured types and docstrings and write working scripts on your behalf.
+
+> **Using an AI assistant?** Point it at [`AGENTS.md`](AGENTS.md) before it writes any code. It's a one-read orientation doc — domain glossary, do's and don'ts, common pitfalls, and an FAQ — built specifically for agents driving this library.
 
 ---
 

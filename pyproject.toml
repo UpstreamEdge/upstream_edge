@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "upstream-edge"
-version = "1.0.1"
+version = "1.0.2"
 description = "Upstream Edge Obsidian database tools and integrations"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -36,6 +36,9 @@ Repository = "https://github.com/UpstreamEdge/upstream_edge"
 
 [tool.hatch.build.targets.wheel]
 packages = ["upstream_edge"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"AGENTS.md" = "upstream_edge/obsidian_db/AGENTS.md"
 
 [tool.ruff]
 line-length = 100
