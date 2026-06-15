@@ -40,6 +40,15 @@ from .models import (
 EnumT = TypeVar("EnumT", bound=StrEnum)
 
 
+# Per-well override models live in the shared model tables under synthetic
+# "<scenario><>{prop_id}" names. Unfiltered listings exclude them so only real
+# shared models appear; fetching by exact name still works.
+def _shared_model_where(column: str, name: str | None) -> str:
+    if name is None:
+        return f"WHERE instr({column}, '<>') = 0"
+    return f"WHERE {column} = ?"
+
+
 def wells(conn: sqlite3.Connection) -> list[Well]:
     """Return every well header ordered by PropID."""
     rows = _query(
@@ -106,10 +115,10 @@ def production_monthly(conn: sqlite3.Connection, prop_id: str | None = None) -> 
     return [
         MonthlyRow(
             prop_id=str(row["prop_id"]),
-            month=_date_from_db(row["month"], field="Monthly.month"),
-            oil_bbl=_optional_float(row["oil_monthly_bbl"]),
-            gas_mscf=_optional_float(row["gas_monthly_mscf"]),
-            water_bbl=_optional_float(row["water_monthly_bbl"]),
+            month=_month_from_db(row["month"], field="Monthly.month"),
+            oil_bbl=_optional_float(row["oil_monthly_bbl"], field="Monthly.oil_monthly_bbl"),
+            gas_mscf=_optional_float(row["gas_monthly_mscf"], field="Monthly.gas_monthly_mscf"),
+            water_bbl=_optional_float(row["water_monthly_bbl"], field="Monthly.water_monthly_bbl"),
         )
         for row in rows
     ]
@@ -133,9 +142,9 @@ def production_daily(conn: sqlite3.Connection, prop_id: str | None = None) -> li
         DailyRow(
             prop_id=str(row["prop_id"]),
             date=_date_from_db(row["date"], field="Daily.date"),
-            oil_bopd=_optional_float(row["oil_bopd"]),
-            gas_mcfd=_optional_float(row["gas_mcfd"]),
-            water_bwpd=_optional_float(row["water_bwpd"]),
+            oil_bopd=_optional_float(row["oil_bopd"], field="Daily.oil_bopd"),
+            gas_mcfd=_optional_float(row["gas_mcfd"], field="Daily.gas_mcfd"),
+            water_bwpd=_optional_float(row["water_bwpd"], field="Daily.water_bwpd"),
         )
         for row in rows
     ]
@@ -169,13 +178,13 @@ def forecasts(
         Forecast(
             prop_id=str(row["prop_id"]),
             model=str(row["model"]),
-            phase=_enum_from_db(Phase, row["phase"], field="Forecast.phase"),
+            phase=_enum_from_db(Phase, str(row["phase"]).upper(), field="Forecast.phase"),
             start=_date_from_db(row["start"], field="Forecast.start"),
             type_curve=_optional_str(row["type_curve"]),
-            rate_init=float(row["rate_init"]),
-            decline_init=float(row["decline_init"]),
-            b_factor=float(row["b_factor"]),
-            decline_min=float(row["decline_min"]),
+            rate_init=_optional_float(row["rate_init"], field="Forecast.rate_init"),
+            decline_init=_optional_float(row["decline_init"], field="Forecast.decline_init"),
+            b_factor=_optional_float(row["b_factor"], field="Forecast.b_factor"),
+            decline_min=_optional_float(row["decline_min"], field="Forecast.decline_min"),
         )
         for row in rows
     ]
@@ -209,7 +218,7 @@ def price_models(conn: sqlite3.Connection, name: str | None = None) -> list[Pric
 
 def expense_models(conn: sqlite3.Connection, name: str | None = None) -> list[ExpenseModel]:
     """Return expense model segments, optionally filtered by name."""
-    where = "" if name is None else "WHERE exp_model_name = ?"
+    where = _shared_model_where("exp_model_name", name)
     params: tuple[object, ...] = () if name is None else (name,)
     rows = _query(
         conn,
@@ -239,7 +248,7 @@ def expense_models(conn: sqlite3.Connection, name: str | None = None) -> list[Ex
 
 def tax_models(conn: sqlite3.Connection, name: str | None = None) -> list[TaxModel]:
     """Return tax model segments, optionally filtered by name."""
-    where = "" if name is None else "WHERE tax_model_name = ?"
+    where = _shared_model_where("tax_model_name", name)
     params: tuple[object, ...] = () if name is None else (name,)
     rows = _query(
         conn,
@@ -269,7 +278,7 @@ def tax_models(conn: sqlite3.Connection, name: str | None = None) -> list[TaxMod
 
 def diff_models(conn: sqlite3.Connection, name: str | None = None) -> list[DiffModel]:
     """Return differential model segments, optionally filtered by name."""
-    where = "" if name is None else "WHERE diff_model_name = ?"
+    where = _shared_model_where("diff_model_name", name)
     params: tuple[object, ...] = () if name is None else (name,)
     rows = _query(
         conn,
@@ -307,7 +316,7 @@ def shrink_yield_models(
     conn: sqlite3.Connection, name: str | None = None
 ) -> list[ShrinkYieldModel]:
     """Return shrink/yield models, optionally filtered by name."""
-    where = "" if name is None else "WHERE shrink_yield_model_name = ?"
+    where = _shared_model_where("shrink_yield_model_name", name)
     params: tuple[object, ...] = () if name is None else (name,)
     rows = _query(
         conn,
@@ -543,8 +552,10 @@ def reservoirs(conn: sqlite3.Connection, prop_id: str | None = None) -> list[Res
         Reservoir(
             prop_id=str(row["prop_id"]),
             reservoir=str(row["reservoir"]),
-            top_depth_ft=float(row["top_depth_ft"]),
-            thickness_ft=_optional_float(row["gross_thickness_ft"]),
+            top_depth_ft=_optional_float(row["top_depth_ft"], field="Reservoir.top_depth_ft"),
+            thickness_ft=_optional_float(
+                row["gross_thickness_ft"], field="Reservoir.gross_thickness_ft"
+            ),
         )
         for row in rows
     ]
@@ -567,9 +578,11 @@ def completions(conn: sqlite3.Connection, prop_id: str | None = None) -> list[Co
     return [
         Completion(
             prop_id=str(row["prop_id"]),
-            frac_proppant_lb=_optional_float(row["frac_proppant_lb"]),
-            frac_fluid_bbl=_optional_float(row["frac_fluid_bbl"]),
-            frac_stages=_optional_int(row["frac_stages"]),
+            frac_proppant_lb=_optional_float(
+                row["frac_proppant_lb"], field="Completion.frac_proppant_lb"
+            ),
+            frac_fluid_bbl=_optional_float(row["frac_fluid_bbl"], field="Completion.frac_fluid_bbl"),
+            frac_stages=_optional_int(row["frac_stages"], field="Completion.frac_stages"),
         )
         for row in rows
     ]
@@ -592,8 +605,8 @@ def perfs(conn: sqlite3.Connection, prop_id: str | None = None) -> list[Perfs]:
     return [
         Perfs(
             prop_id=str(row["prop_id"]),
-            perf_start_md_ft=float(row["perf_start_md_ft"]),
-            perf_end_md_ft=float(row["perf_end_md_ft"]),
+            perf_start_md_ft=_optional_float(row["perf_start_md_ft"], field="Perfs.perf_start_md_ft"),
+            perf_end_md_ft=_optional_float(row["perf_end_md_ft"], field="Perfs.perf_end_md_ft"),
             producing=bool(row["producing"]),
         )
         for row in rows
@@ -616,18 +629,18 @@ def _well_from_row(row: sqlite3.Row) -> Well:
         category=_optional_str(row["category"]),
         group=_optional_str(row["group"]),
         reservoir=_optional_str(row["reservoir"]),
-        tvd_ft=_optional_float(row["tvd"]),
-        md_ft=_optional_float(row["md"]),
-        lateral_length_ft=_optional_float(row["lateral_length"]),
+        tvd_ft=_optional_float(row["tvd"], field="Main.tvd"),
+        md_ft=_optional_float(row["md"], field="Main.md"),
+        lateral_length_ft=_optional_float(row["lateral_length"], field="Main.lateral_length"),
         spud=_optional_date(row["spud"], field="Main.spud"),
         completion=_optional_date(row["completion"], field="Main.completion"),
         first_prod=_optional_date(row["first_prod"], field="Main.first_prod"),
         state=_optional_str(row["state"]),
         county=_optional_str(row["county"]),
-        surface_latitude=_optional_float(row["surface_latitude"]),
-        surface_longitude=_optional_float(row["surface_longitude"]),
-        bh_latitude=_optional_float(row["bh_latitude"]),
-        bh_longitude=_optional_float(row["bh_longitude"]),
+        surface_latitude=_optional_float(row["surface_latitude"], field="Main.surface_latitude"),
+        surface_longitude=_optional_float(row["surface_longitude"], field="Main.surface_longitude"),
+        bh_latitude=_optional_float(row["bh_latitude"], field="Main.bh_latitude"),
+        bh_longitude=_optional_float(row["bh_longitude"], field="Main.bh_longitude"),
     )
 
 
@@ -640,20 +653,48 @@ def _query(
         raise DataIntegrityError(f"SQLite operation failed for reader query: {exc}") from exc
 
 
+# Obsidian databases may store missing optional values as empty strings rather
+# than SQL NULL, so every optional read must treat "" as absent.
 def _optional_str(value: object) -> str | None:
-    return None if value is None else str(value)
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
 
 
-def _optional_float(value: object) -> float | None:
-    return None if value is None else float(str(value))
+def _optional_float(value: object, *, field: str) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError as exc:
+        raise DataIntegrityError(f"{field} has non-numeric value {value!r}") from exc
 
 
-def _optional_int(value: object) -> int | None:
-    return None if value is None else int(str(value))
+def _optional_int(value: object, *, field: str) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        number = float(text)
+    except ValueError as exc:
+        raise DataIntegrityError(f"{field} has non-integer value {value!r}") from exc
+    if not number.is_integer():
+        raise DataIntegrityError(f"{field} has non-integer value {value!r}")
+    return int(number)
 
 
 def _optional_date(value: object, *, field: str) -> date | None:
-    return None if value is None else _date_from_db(value, field=field)
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return _date_from_db(value, field=field)
 
 
 def _date_from_db(value: object, *, field: str) -> date:
@@ -663,6 +704,18 @@ def _date_from_db(value: object, *, field: str) -> date:
         return date.fromisoformat(value)
     except ValueError as exc:
         raise DataIntegrityError(f"{field} has invalid ISO date value {value!r}") from exc
+
+
+# Obsidian databases store Monthly.month as 6-digit YYYYMM text (e.g. '202306').
+# ISO dates are also accepted for compatibility with rows written by older
+# versions of this library.
+def _month_from_db(value: object, *, field: str) -> date:
+    if isinstance(value, str) and len(value) == 6 and value.isdigit():
+        month = int(value[4:6])
+        if not 1 <= month <= 12:
+            raise DataIntegrityError(f"{field} has invalid YYYYMM value {value!r}")
+        return date(int(value[:4]), month, 1)
+    return _date_from_db(value, field=field)
 
 
 def _enum_from_db(enum_cls: type[EnumT], value: object, *, field: str) -> EnumT:

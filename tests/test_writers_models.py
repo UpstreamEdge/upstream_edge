@@ -87,7 +87,9 @@ def test_shared_model_writers_round_trip(tmp_path):
         assert db.diff_models("DIFF")[0].oil_method is DiffType.DOLLAR
         assert db.shrink_yield_models("SY")[0].gas_shrink_frac == 0.12
 
-        db.delete_expense_model("OPEX")
+        with pytest.raises(ValidationError, match="confirm=True"):
+            db.delete_expense_model("OPEX")
+        db.delete_expense_model("OPEX", confirm=True)
         assert db.expense_models("OPEX") == []
 
 

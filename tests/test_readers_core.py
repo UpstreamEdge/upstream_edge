@@ -61,6 +61,35 @@ def test_wells_and_single_well_mapping(tmp_path):
     assert well.first_prod == date(2024, 3, 1)
 
 
+def test_wells_treats_empty_strings_as_missing(tmp_path):
+    # Obsidian databases may store missing optional values as empty strings
+    # rather than NULL; readers must map them to None instead of crashing.
+    db_path = tmp_path / "empty.obsdb"
+    exec_sql(
+        db_path,
+        [
+            MAIN_SCHEMA,
+            (
+                "insert into Main values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("P1", "", "PDP", "MITCHELL", "1H", "", "", "", "", "", "", "",
+                 "", "", "", "", "", "", "", "", "", ""),
+            ),
+        ],
+    )
+
+    with Database.open(db_path) as db:
+        wells = db.wells()
+
+    assert len(wells) == 1
+    well = wells[0]
+    assert well.api_10 is None
+    assert well.field is None
+    assert well.tvd_ft is None
+    assert well.spud is None
+    assert well.surface_latitude is None
+    assert well.bh_longitude is None
+
+
 def test_well_by_api_and_absent_well(tmp_path):
     db_path = tmp_path / "api.obsdb"
     exec_sql(
@@ -117,6 +146,41 @@ def test_production_readers_filter_and_parse_dates(tmp_path):
     assert daily[0].date == date(2024, 1, 2)
 
 
+def test_production_monthly_reads_native_yyyymm_dates(tmp_path):
+    db_path = tmp_path / "yyyymm.obsdb"
+    exec_sql(
+        db_path,
+        [
+            (
+                "create table Monthly (prop_id text, month text, oil_monthly_bbl real, "
+                "gas_monthly_mscf real, water_monthly_bbl real)"
+            ),
+            ("insert into Monthly values (?, ?, ?, ?, ?)", ("P1", "202306", 10.0, 20.0, 30.0)),
+            ("insert into Monthly values (?, ?, ?, ?, ?)", ("P1", "2023-07-01", 11.0, 21.0, 31.0)),
+        ],
+    )
+
+    with Database.open(db_path) as db:
+        rows = db.production_monthly("P1")
+
+    assert sorted(row.month for row in rows) == [date(2023, 6, 1), date(2023, 7, 1)]
+
+    bad_path = tmp_path / "yyyymm_bad.obsdb"
+    exec_sql(
+        bad_path,
+        [
+            (
+                "create table Monthly (prop_id text, month text, oil_monthly_bbl real, "
+                "gas_monthly_mscf real, water_monthly_bbl real)"
+            ),
+            ("insert into Monthly values (?, ?, ?, ?, ?)", ("P1", "202313", 1.0, 2.0, 3.0)),
+        ],
+    )
+    with Database.open(bad_path) as db:
+        with pytest.raises(DataIntegrityError, match="YYYYMM"):
+            db.production_monthly("P1")
+
+
 def test_reader_rejects_unknown_enum(tmp_path):
     db_path = tmp_path / "bad.obsdb"
     exec_sql(
@@ -129,4 +193,63 @@ def test_reader_rejects_unknown_enum(tmp_path):
 
     with Database.open(db_path) as db:
         with pytest.raises(DataIntegrityError, match="rsv_cat"):
+            db.wells()
+
+
+def test_reservoir_and_perf_readers_allow_null_depths(tmp_path):
+    db_path = tmp_path / "null_depths.obsdb"
+    exec_sql(
+        db_path,
+        [
+            (
+                "create table Reservoir (prop_id text, reservoir text, top_depth_ft real, "
+                "gross_thickness_ft real)"
+            ),
+            ("create table Perfs (prop_id text, perf_start_md_ft real, perf_end_md_ft real, producing integer)"),
+            ("insert into Reservoir values (?, ?, ?, ?)", ("P1", "COTTON VALLEY", None, None)),
+            ("insert into Perfs values (?, ?, ?, ?)", ("P1", None, None, None)),
+        ],
+    )
+
+    with Database.open(db_path) as db:
+        reservoir = db.reservoirs("P1")[0]
+        perf = db.perfs("P1")[0]
+
+    assert reservoir.top_depth_ft is None
+    assert perf.perf_start_md_ft is None
+    assert perf.producing is False
+
+
+def test_attribute_readers_tolerate_missing_table(tmp_path):
+    # Older databases may predate the WellAttributes table entirely.
+    db_path = tmp_path / "no_attrs.obsdb"
+    exec_sql(
+        db_path,
+        [
+            MAIN_SCHEMA,
+            ("insert into Main (prop_id, rsv_cat) values (?, ?)", ("P1", "PDP")),
+        ],
+    )
+
+    with Database.open(db_path) as db:
+        assert db.list_attribute_columns() == []
+        assert db.well_attributes("P1") == {}
+        assert db.all_well_attributes() == {}
+
+
+def test_reader_wraps_non_numeric_values(tmp_path):
+    db_path = tmp_path / "bad_float.obsdb"
+    exec_sql(
+        db_path,
+        [
+            MAIN_SCHEMA,
+            (
+                "insert into Main (prop_id, rsv_cat, surface_latitude) values (?, ?, ?)",
+                ("P1", "PDP", "abc"),
+            ),
+        ],
+    )
+
+    with Database.open(db_path) as db:
+        with pytest.raises(DataIntegrityError, match="surface_latitude"):
             db.wells()

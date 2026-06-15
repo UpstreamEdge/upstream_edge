@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import date
 
 import pytest
-from conftest import create_core_schema
+from conftest import create_core_schema, exec_sql
 
 from upstream_edge.obsidian_db import (
     CapexItem,
@@ -41,8 +42,8 @@ def test_add_well_writes_default_cascade(tmp_path):
     assert well is not None
     assert well.well_name == "MITCHELL 1H"
     assert well_models.interest_model == "MAIN"
-    assert interest.wi_pct == 1.0
-    assert interest.nri_pct == 0.75
+    assert interest.wi_pct == 100.0
+    assert interest.nri_pct == 75.0
     assert abandonment.cost_gross == 100000.0
     assert attrs == {
         "Basin": "",
@@ -139,6 +140,54 @@ def test_set_monthly_prod_upserts_and_backfills_header_dates(tmp_path):
     assert well.first_prod == date(2024, 5, 1)
 
 
+def test_set_monthly_prod_stores_native_yyyymm_text(tmp_path):
+    db_path = tmp_path / "monthly_fmt.obsdb"
+    create_core_schema(db_path)
+
+    with Database.open(db_path) as db:
+        db.add_well("P1", rsv_cat=RsvCat.PDP)
+        db.set_monthly_prod([MonthlyRow("P1", date(2024, 5, 1), 10.0, 20.0, 30.0)])
+
+    conn = sqlite3.connect(db_path)
+    try:
+        stored = conn.execute("select month from Monthly").fetchone()[0]
+    finally:
+        conn.close()
+    assert stored == "202405"
+
+
+def test_writers_reject_raw_enum_strings(tmp_path):
+    db_path = tmp_path / "raw_enums.obsdb"
+    create_core_schema(db_path)
+
+    with Database.open(db_path) as db:
+        with pytest.raises(ValidationError, match="rsv_cat must be a RsvCat"):
+            db.add_well("P1", rsv_cat="NOT_A_CATEGORY")  # type: ignore[arg-type]
+
+        db.add_well("P1", rsv_cat=RsvCat.PDP)
+        with pytest.raises(ValidationError, match="rsv_cat must be a RsvCat"):
+            db.set_well_header("P1", rsv_cat="PDP")
+        with pytest.raises(ValidationError, match="phase must be a Phase"):
+            db.set_forecast(
+                "P1",
+                "BASE",
+                "Oil",  # type: ignore[arg-type]
+                [ForecastSegment(date(2026, 1, 1), 1.0, 0.5, 1.0, 0.05)],
+            )
+        with pytest.raises(ValidationError, match="job_type must be a CapexJobType"):
+            db.set_capex(
+                "P1",
+                "MAIN",
+                [
+                    CapexItem(
+                        date=date(2026, 1, 1),
+                        job_type="Pump Repair",  # type: ignore[arg-type]
+                        cost_gross=1.0,
+                    )
+                ],
+            )
+
+
 def test_set_monthly_prod_validates_well_and_month(tmp_path):
     db_path = tmp_path / "monthly_bad.obsdb"
     create_core_schema(db_path)
@@ -164,7 +213,9 @@ def test_daily_prod_upsert_and_delete_methods(tmp_path):
         db.set_daily_prod([DailyRow("P1", date(2024, 5, 2), 4.0, 5.0, 6.0)])
         assert db.production_daily("P1")[0].oil_bopd == 4.0
 
-        db.delete_daily_prod("P1")
+        with pytest.raises(ValidationError, match="confirm=True"):
+            db.delete_daily_prod("P1")
+        db.delete_daily_prod("P1", confirm=True)
         assert db.production_daily("P1") == []
 
         db.set_daily_prod([DailyRow("P2", date(2024, 5, 2), 1.0, 2.0, 3.0)])
@@ -216,8 +267,8 @@ def test_set_forecast_replaces_segments_and_delete_requires_confirm(tmp_path):
         assert [row.rate_init for row in rows] == [110.0, 90.0]
 
         with pytest.raises(ValidationError, match="confirm=True"):
-            db.delete_forecast(model="BASE")
-        db.delete_forecast("P1", model="BASE", phase=Phase.OIL)
+            db.delete_forecast("P1", model="BASE", phase=Phase.OIL)
+        db.delete_forecast("P1", model="BASE", phase=Phase.OIL, confirm=True)
 
         assert db.forecasts("P1", "BASE") == []
 
@@ -255,14 +306,14 @@ def test_set_interest_gap_fills_new_model(tmp_path):
         db.set_interest(
             "P1",
             "CASE_A",
-            [InterestSegment(start=date(2026, 1, 1), wi_pct=0.8, nri_pct=0.6)],
+            [InterestSegment(start=date(2026, 1, 1), wi_pct=80.0, nri_pct=60.0)],
         )
 
         p1 = db.interest("P1", "CASE_A")[0]
         p2 = db.interest("P2", "CASE_A")[0]
 
-    assert p1.wi_pct == 0.8
-    assert p1.nri_pct == 0.6
+    assert p1.wi_pct == 80.0
+    assert p1.nri_pct == 60.0
     assert p2.start == date(2000, 1, 1)
     assert p2.wi_pct == 0.0
     assert p2.nri_pct == 0.0
@@ -277,16 +328,16 @@ def test_interest_delete_and_validation(tmp_path):
 
         with pytest.raises(ValidationError, match="segments cannot be empty"):
             db.set_interest("P1", "MAIN", [])
-        with pytest.raises(ValidationError, match="between 0 and 1"):
+        with pytest.raises(ValidationError, match="between 0 and 100"):
             db.set_interest(
                 "P1",
                 "MAIN",
-                [InterestSegment(start=date(2026, 1, 1), wi_pct=1.2, nri_pct=0.6)],
+                [InterestSegment(start=date(2026, 1, 1), wi_pct=120.0, nri_pct=60.0)],
             )
 
         with pytest.raises(ValidationError, match="confirm=True"):
-            db.delete_interest()
-        db.delete_interest("P1", "MAIN")
+            db.delete_interest("P1", "MAIN")
+        db.delete_interest("P1", "MAIN", confirm=True)
         assert db.interest("P1", "MAIN") == []
 
 
@@ -320,9 +371,14 @@ def test_set_capex_and_abandonment(tmp_path):
         with pytest.raises(ValidationError, match="items cannot be empty"):
             db.set_capex("P1", "MAIN", [])
         with pytest.raises(ValidationError, match="confirm=True"):
-            db.delete_capex()
-        db.delete_capex("P1", "MAIN")
+            db.delete_capex("P1", "MAIN")
+        db.delete_capex("P1", "MAIN", confirm=True)
         assert db.capex("P1", "MAIN") == []
+
+        # Abandonment is cleared by setting the cost to zero, not by deleting the
+        # row; Obsidian keeps an abandonment cost for every well.
+        db.set_abandonment("P1", "MAIN", 0.0)
+        assert db.abandonment("P1", "MAIN")[0].cost_gross == 0.0
 
 
 def test_geology_completion_writers_round_trip(tmp_path):
@@ -362,15 +418,60 @@ def test_geology_completion_writers_round_trip(tmp_path):
         assert db.completions("P1")[0].frac_stages == 40
         assert db.perfs("P1")[0].producing is True
 
-        db.delete_surveys("P1")
-        db.delete_reservoir_data("P1", reservoir="Wolfcamp")
+        db.delete_surveys("P1", confirm=True)
+        db.delete_reservoir_data("P1", reservoir="Wolfcamp", confirm=True)
         db.delete_completion("P1", confirm=True)
-        db.delete_perfs("P1")
+        db.delete_perfs("P1", confirm=True)
 
         assert db.surveys("P1") == []
         assert db.reservoirs("P1") == []
         assert db.completions("P1") == []
         assert db.perfs("P1") == []
+
+
+def test_set_reservoir_preserves_unmanaged_columns(tmp_path):
+    # Reservoir rows may carry geology columns the library does not manage;
+    # updating top depth / thickness must not wipe them.
+    db_path = tmp_path / "reservoir_preserve.obsdb"
+    exec_sql(
+        db_path,
+        [
+            (
+                "create table Main (prop_id text primary key, api_10 text, rsv_cat text not null, "
+                'lease text, well_number text, field text, operator text, category text, "group" text, '
+                "reservoir text, tvd real, md real, lateral_length real, spud text, completion text, "
+                "first_prod text, state text, county text, surface_latitude real, "
+                "surface_longitude real, bh_latitude real, bh_longitude real)"
+            ),
+            (
+                "create table Reservoir (prop_id text, reservoir text, top_depth_ft real, "
+                "gross_thickness_ft real, porosity_pct real, matrix_perm_md real, "
+                "pressure_init_psi real, sat_oil_init real, sat_gas_init real, sat_water_init real)"
+            ),
+            ("insert into Main (prop_id, rsv_cat) values (?, ?)", ("P1", "PDP")),
+            (
+                "insert into Reservoir values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("P1", "Wolfcamp", 9000.0, 250.0, 8.5, 0.1, 4200.0, 0.6, 0.2, 0.2),
+            ),
+        ],
+    )
+
+    with Database.open(db_path) as db:
+        db.set_reservoir("P1", "Wolfcamp", top_depth_ft=9100.0, thickness_ft=260.0)
+        reservoir = db.reservoirs("P1")[0]
+
+    assert reservoir.top_depth_ft == 9100.0
+    assert reservoir.thickness_ft == 260.0
+
+    conn = sqlite3.connect(db_path)
+    try:
+        extras = conn.execute(
+            "select porosity_pct, matrix_perm_md, pressure_init_psi, "
+            "sat_oil_init, sat_gas_init, sat_water_init from Reservoir where prop_id = 'P1'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert extras == (8.5, 0.1, 4200.0, 0.6, 0.2, 0.2)
 
 
 def test_geology_writers_validate_empty_inputs_and_confirm(tmp_path):

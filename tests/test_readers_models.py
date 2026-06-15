@@ -24,17 +24,36 @@ def test_forecasts_reader(tmp_path):
             ),
             (
                 "insert into Forecast values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("P1", "BASE", "Oil", "2026-01-01", "", 500.0, 0.7, 1.1, 0.06),
+                ("P1", "BASE", "OIL", "2026-01-01", "", 500.0, 0.7, 1.1, 0.06),
+            ),
+            # Phase casing is read case-insensitively.
+            (
+                "insert into Forecast values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("P1", "BASE", "Gas", "2026-01-01", "", 900.0, 0.7, 1.1, 0.06),
+            ),
+            # Segments driven by a type curve have no decline parameters of their own.
+            (
+                "insert into Forecast values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("P1", "BASE", "WATER", "2026-01-01", "TC_A", None, None, None, None),
             ),
         ],
     )
 
     with Database.open(db_path) as db:
-        forecast = db.forecasts(prop_id="P1")[0]
+        forecasts = db.forecasts(prop_id="P1")
 
-    assert forecast.phase is Phase.OIL
-    assert forecast.start == date(2026, 1, 1)
-    assert forecast.type_curve == ""
+    oil = next(row for row in forecasts if row.phase is Phase.OIL)
+    gas = next(row for row in forecasts if row.phase is Phase.GAS)
+    water = next(row for row in forecasts if row.phase is Phase.WATER)
+
+    assert oil.start == date(2026, 1, 1)
+    # Obsidian databases may store missing optional values as empty strings; read back as None.
+    assert oil.type_curve is None
+    assert oil.rate_init == 500.0
+    assert gas.rate_init == 900.0
+    assert water.type_curve == "TC_A"
+    assert water.rate_init is None
+    assert water.decline_min is None
 
 
 def test_shared_economic_model_readers(tmp_path):

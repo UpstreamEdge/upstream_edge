@@ -67,10 +67,18 @@ class Database:
         Returns:
             An open Database instance.
 
+        Raises:
+            FileNotFoundError: The path does not exist (":memory:" excepted).
+
         Example:
             >>> db = Database.open(":memory:")
             >>> db.close()
         """
+        if str(path) != ":memory:" and not Path(path).exists():
+            raise FileNotFoundError(
+                f"Obsidian database not found at {str(path)!r}; "
+                "Database.open() does not create new files"
+            )
         db_path = Path(path)
         conn = sqlite3.connect(db_path, isolation_level=None)
         conn.row_factory = sqlite3.Row
@@ -473,40 +481,40 @@ class Database:
         with self._write_context() as conn:
             writers.set_price_model(conn, name, segments)
 
-    def delete_price_model(self, name: str) -> None:
+    def delete_price_model(self, name: str, *, confirm: bool = False) -> None:
         """Delete all segments for a price model."""
         with self._write_context() as conn:
-            writers.delete_price_model(conn, name)
+            writers.delete_price_model(conn, name, confirm=confirm)
 
     def set_expense_model(self, name: str, segments: list[ExpenseModelSegment]) -> None:
         """Replace a shared expense model."""
         with self._write_context() as conn:
             writers.set_expense_model(conn, name, segments)
 
-    def delete_expense_model(self, name: str) -> None:
+    def delete_expense_model(self, name: str, *, confirm: bool = False) -> None:
         """Delete a shared expense model."""
         with self._write_context() as conn:
-            writers.delete_expense_model(conn, name)
+            writers.delete_expense_model(conn, name, confirm=confirm)
 
     def set_tax_model(self, name: str, segments: list[TaxModelSegment]) -> None:
         """Replace a shared tax model."""
         with self._write_context() as conn:
             writers.set_tax_model(conn, name, segments)
 
-    def delete_tax_model(self, name: str) -> None:
+    def delete_tax_model(self, name: str, *, confirm: bool = False) -> None:
         """Delete a shared tax model."""
         with self._write_context() as conn:
-            writers.delete_tax_model(conn, name)
+            writers.delete_tax_model(conn, name, confirm=confirm)
 
     def set_diff_model(self, name: str, segments: list[DiffModelSegment]) -> None:
         """Replace a shared differential model."""
         with self._write_context() as conn:
             writers.set_diff_model(conn, name, segments)
 
-    def delete_diff_model(self, name: str) -> None:
+    def delete_diff_model(self, name: str, *, confirm: bool = False) -> None:
         """Delete a shared differential model."""
         with self._write_context() as conn:
-            writers.delete_diff_model(conn, name)
+            writers.delete_diff_model(conn, name, confirm=confirm)
 
     def set_shrink_yield_model(
         self,
@@ -524,78 +532,10 @@ class Database:
                 ngl_yield_bbl_mmscf=ngl_yield_bbl_mmscf,
             )
 
-    def delete_shrink_yield_model(self, name: str) -> None:
+    def delete_shrink_yield_model(self, name: str, *, confirm: bool = False) -> None:
         """Delete a shared shrink/yield model."""
         with self._write_context() as conn:
-            writers.delete_shrink_yield_model(conn, name)
-
-    def set_well_expense_model(
-        self,
-        prop_id: str,
-        scenario: str,
-        segments: list[ExpenseModelSegment],
-    ) -> None:
-        """Replace a per-well expense model override."""
-        with self._write_context() as conn:
-            writers.set_well_expense_model(conn, prop_id, scenario, segments)
-
-    def delete_well_expense_model(self, prop_id: str, scenario: str) -> None:
-        """Delete a per-well expense model override."""
-        with self._write_context() as conn:
-            writers.delete_well_expense_model(conn, prop_id, scenario)
-
-    def set_well_tax_model(
-        self,
-        prop_id: str,
-        scenario: str,
-        segments: list[TaxModelSegment],
-    ) -> None:
-        """Replace a per-well tax model override."""
-        with self._write_context() as conn:
-            writers.set_well_tax_model(conn, prop_id, scenario, segments)
-
-    def delete_well_tax_model(self, prop_id: str, scenario: str) -> None:
-        """Delete a per-well tax model override."""
-        with self._write_context() as conn:
-            writers.delete_well_tax_model(conn, prop_id, scenario)
-
-    def set_well_diff_model(
-        self,
-        prop_id: str,
-        scenario: str,
-        segments: list[DiffModelSegment],
-    ) -> None:
-        """Replace a per-well differential model override."""
-        with self._write_context() as conn:
-            writers.set_well_diff_model(conn, prop_id, scenario, segments)
-
-    def delete_well_diff_model(self, prop_id: str, scenario: str) -> None:
-        """Delete a per-well differential model override."""
-        with self._write_context() as conn:
-            writers.delete_well_diff_model(conn, prop_id, scenario)
-
-    def set_well_shrink_yield_model(
-        self,
-        prop_id: str,
-        scenario: str,
-        *,
-        gas_shrink_frac: float,
-        ngl_yield_bbl_mmscf: float,
-    ) -> None:
-        """Replace a per-well shrink/yield model override."""
-        with self._write_context() as conn:
-            writers.set_well_shrink_yield_model(
-                conn,
-                prop_id,
-                scenario,
-                gas_shrink_frac=gas_shrink_frac,
-                ngl_yield_bbl_mmscf=ngl_yield_bbl_mmscf,
-            )
-
-    def delete_well_shrink_yield_model(self, prop_id: str, scenario: str) -> None:
-        """Delete a per-well shrink/yield model override."""
-        with self._write_context() as conn:
-            writers.delete_well_shrink_yield_model(conn, prop_id, scenario)
+            writers.delete_shrink_yield_model(conn, name, confirm=confirm)
 
     def create_scenario(self, name: str, *, copy_from: str | None = None) -> None:
         """Create a scenario, optionally copying another scenario's assignments."""
@@ -675,7 +615,11 @@ class Database:
             writers.delete_capex(conn, prop_id, model, confirm=confirm)
 
     def set_abandonment(self, prop_id: str, model: str, cost_gross: float) -> None:
-        """Replace one abandonment cost row."""
+        """Replace one abandonment cost row.
+
+        Every well carries an abandonment cost for each model; pass
+        ``cost_gross=0.0`` to clear it rather than removing the row.
+        """
         with self._write_context() as conn:
             writers.set_abandonment(conn, prop_id, model, cost_gross)
 

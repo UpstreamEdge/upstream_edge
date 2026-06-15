@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "upstream-edge"
-version = "1.0.2"
+version = "1.1.0"
 description = "Upstream Edge Obsidian database tools and integrations"
 readme = "README.md"
 requires-python = ">=3.11"

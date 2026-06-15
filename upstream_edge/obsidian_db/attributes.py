@@ -22,6 +22,9 @@ def list_attribute_columns(conn: sqlite3.Connection) -> list[AttributeColumn]:
 
 def well_attributes(conn: sqlite3.Connection, prop_id: str) -> dict[str, AttributeValue]:
     """Return one well's WellAttributes values."""
+    # Older databases may predate the WellAttributes table entirely.
+    if not _table_exists(conn):
+        return {}
     attr_types = _attribute_types(conn)
     row = conn.execute(
         f"SELECT * FROM {quote_identifier('WellAttributes')} WHERE prop_id = ?", (prop_id,)
@@ -39,6 +42,8 @@ def well_attributes(conn: sqlite3.Connection, prop_id: str) -> dict[str, Attribu
 
 def all_well_attributes(conn: sqlite3.Connection) -> dict[str, dict[str, AttributeValue]]:
     """Return WellAttributes values for every PropID."""
+    if not _table_exists(conn):
+        return {}
     attr_types = _attribute_types(conn)
     rows = conn.execute(
         f"SELECT * FROM {quote_identifier('WellAttributes')} ORDER BY prop_id"
@@ -50,6 +55,15 @@ def all_well_attributes(conn: sqlite3.Connection) -> dict[str, dict[str, Attribu
         }
         for row in rows
     }
+
+
+def _table_exists(conn: sqlite3.Connection) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'WellAttributes' LIMIT 1"
+        ).fetchone()
+        is not None
+    )
 
 
 def _attribute_types(conn: sqlite3.Connection) -> dict[str, AttributeType]:

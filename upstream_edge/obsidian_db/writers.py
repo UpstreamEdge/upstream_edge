@@ -10,9 +10,17 @@ from datetime import date
 from enum import StrEnum
 
 from ._sql import quote_identifier
-from ._validation import reject_reserved_name, validate_api10, validate_month, validate_percentage
+from ._validation import (
+    reject_reserved_name,
+    validate_api10,
+    validate_month,
+    validate_percent_0_100,
+    validate_percentage,
+)
 from .enums import (
     AttributeType,
+    CapexJobType,
+    DiffType,
     ExpenseModelKind,
     Phase,
     RsvCat,
@@ -108,6 +116,7 @@ def add_well(
     header_fields: Mapping[str, object],
 ) -> None:
     """Insert a Main row for a new well."""
+    _require_enum(rsv_cat, RsvCat, method="add_well", param="rsv_cat")
     validate_api10(api_10, method="add_well")
     if _exists(conn, "Main", "prop_id", prop_id):
         raise DuplicateError(f"add_well(prop_id={prop_id!r}): PropID already exists")
@@ -128,7 +137,7 @@ def add_well(
         (prop_id,),
     )
     conn.execute(
-        "INSERT INTO Interest (prop_id, model, start, wi_pct, nri_pct) VALUES (?, 'MAIN', '2000-01-01', 1.0, 0.75)",
+        "INSERT INTO Interest (prop_id, model, start, wi_pct, nri_pct) VALUES (?, 'MAIN', '2000-01-01', 100.0, 75.0)",
         (prop_id,),
     )
     conn.execute(
@@ -200,8 +209,10 @@ def set_well_header(conn: sqlite3.Connection, prop_id: str, fields: Mapping[str,
             raise ValidationError(
                 f"set_well_header: unknown field {field!r}. Valid fields: {valid}"
             )
-        if field == "rsv_cat" and value is None:
-            raise ValidationError("set_well_header: rsv_cat cannot be cleared")
+        if field == "rsv_cat":
+            if value is None:
+                raise ValidationError("set_well_header: rsv_cat cannot be cleared")
+            _require_enum(value, RsvCat, method="set_well_header", param="rsv_cat")
         if field == "api_10":
             validate_api10(
                 value if isinstance(value, str) or value is None else str(value),
@@ -229,7 +240,15 @@ def set_monthly_prod(conn: sqlite3.Connection, rows: list[MonthlyRow]) -> None:
                 gas_monthly_mscf = excluded.gas_monthly_mscf,
                 water_monthly_bbl = excluded.water_monthly_bbl
             """,
-            (row.prop_id, row.month.isoformat(), row.oil_bbl, row.gas_mscf, row.water_bbl),
+            # Monthly.month is stored as 6-digit YYYYMM text, matching Obsidian's
+            # native format.
+            (
+                row.prop_id,
+                f"{row.month.year:04d}{row.month.month:02d}",
+                row.oil_bbl,
+                row.gas_mscf,
+                row.water_bbl,
+            ),
         )
     for prop_id in sorted({row.prop_id for row in rows}):
         earliest = min(row.month for row in rows if row.prop_id == prop_id)
@@ -267,12 +286,10 @@ def set_daily_prod(conn: sqlite3.Connection, rows: list[DailyRow]) -> None:
 def delete_monthly_prod(
     conn: sqlite3.Connection, prop_id: str | None = None, *, confirm: bool = False
 ) -> None:
-    """Delete monthly production for one well or, with confirmation, all wells."""
+    """Delete monthly production for one well or all wells."""
+    if not confirm:
+        raise ValidationError("delete_monthly_prod: confirm=True is required")
     if prop_id is None:
-        if not confirm:
-            raise ValidationError(
-                "delete_monthly_prod: confirm=True is required when prop_id is None"
-            )
         conn.execute("DELETE FROM Monthly")
         return
     _require_well(conn, prop_id, method="delete_monthly_prod")
@@ -282,12 +299,10 @@ def delete_monthly_prod(
 def delete_daily_prod(
     conn: sqlite3.Connection, prop_id: str | None = None, *, confirm: bool = False
 ) -> None:
-    """Delete daily production for one well or, with confirmation, all wells."""
+    """Delete daily production for one well or all wells."""
+    if not confirm:
+        raise ValidationError("delete_daily_prod: confirm=True is required")
     if prop_id is None:
-        if not confirm:
-            raise ValidationError(
-                "delete_daily_prod: confirm=True is required when prop_id is None"
-            )
         conn.execute("DELETE FROM Daily")
         return
     _require_well(conn, prop_id, method="delete_daily_prod")
@@ -302,6 +317,7 @@ def set_forecast(
     segments: list[ForecastSegment],
 ) -> None:
     """Replace forecast segments for one PropID/model/phase."""
+    _require_enum(phase, Phase, method="set_forecast", param="phase")
     _require_well(conn, prop_id, method="set_forecast")
     if not segments:
         raise ValidationError(
@@ -345,8 +361,10 @@ def delete_forecast(
     confirm: bool = False,
 ) -> None:
     """Delete forecast rows matching optional filters."""
-    if prop_id is None and not confirm:
-        raise ValidationError("delete_forecast: confirm=True is required when prop_id is None")
+    if not confirm:
+        raise ValidationError("delete_forecast: confirm=True is required")
+    if phase is not None:
+        _require_enum(phase, Phase, method="delete_forecast", param="phase")
     clauses: list[str] = []
     params: list[object] = []
     if prop_id is not None:
@@ -376,8 +394,10 @@ def set_price_model(conn: sqlite3.Connection, name: str, segments: list[PriceMod
         )
 
 
-def delete_price_model(conn: sqlite3.Connection, name: str) -> None:
+def delete_price_model(conn: sqlite3.Connection, name: str, *, confirm: bool = False) -> None:
     """Delete all segments for a price model."""
+    if not confirm:
+        raise ValidationError("delete_price_model: confirm=True is required")
     conn.execute("DELETE FROM PriceModel WHERE price_model_name = ?", (name,))
 
 
@@ -385,12 +405,9 @@ def set_expense_model(
     conn: sqlite3.Connection,
     name: str,
     segments: list[ExpenseModelSegment],
-    *,
-    _allow_reserved_name: bool = False,
 ) -> None:
     """Replace a shared expense model."""
-    if not _allow_reserved_name:
-        reject_reserved_name(name, field="name", method="set_expense_model")
+    reject_reserved_name(name, field="name", method="set_expense_model")
     _require_segments(segments, method="set_expense_model", delete_method="delete_expense_model")
     segment_keys = [
         _expense_model_type(segment, method="set_expense_model") for segment in segments
@@ -417,8 +434,10 @@ def set_expense_model(
         )
 
 
-def delete_expense_model(conn: sqlite3.Connection, name: str) -> None:
+def delete_expense_model(conn: sqlite3.Connection, name: str, *, confirm: bool = False) -> None:
     """Delete a shared expense model."""
+    if not confirm:
+        raise ValidationError("delete_expense_model: confirm=True is required")
     conn.execute("DELETE FROM ExpenseModel WHERE exp_model_name = ?", (name,))
 
 
@@ -426,12 +445,9 @@ def set_tax_model(
     conn: sqlite3.Connection,
     name: str,
     segments: list[TaxModelSegment],
-    *,
-    _allow_reserved_name: bool = False,
 ) -> None:
     """Replace a shared tax model."""
-    if not _allow_reserved_name:
-        reject_reserved_name(name, field="name", method="set_tax_model")
+    reject_reserved_name(name, field="name", method="set_tax_model")
     _require_segments(segments, method="set_tax_model", delete_method="delete_tax_model")
     segment_keys = [_tax_model_type(segment, method="set_tax_model") for segment in segments]
     _require_unique_text(segment_keys, method="set_tax_model", label="model_type")
@@ -461,8 +477,10 @@ def set_tax_model(
         )
 
 
-def delete_tax_model(conn: sqlite3.Connection, name: str) -> None:
+def delete_tax_model(conn: sqlite3.Connection, name: str, *, confirm: bool = False) -> None:
     """Delete a shared tax model."""
+    if not confirm:
+        raise ValidationError("delete_tax_model: confirm=True is required")
     conn.execute("DELETE FROM TaxModel WHERE tax_model_name = ?", (name,))
 
 
@@ -470,14 +488,15 @@ def set_diff_model(
     conn: sqlite3.Connection,
     name: str,
     segments: list[DiffModelSegment],
-    *,
-    _allow_reserved_name: bool = False,
 ) -> None:
     """Replace a shared differential model."""
-    if not _allow_reserved_name:
-        reject_reserved_name(name, field="name", method="set_diff_model")
+    reject_reserved_name(name, field="name", method="set_diff_model")
     _require_segments(segments, method="set_diff_model", delete_method="delete_diff_model")
     _require_unique_dates([segment.start_date for segment in segments], method="set_diff_model")
+    for segment in segments:
+        _require_enum(segment.oil_method, DiffType, method="set_diff_model", param="oil_method")
+        _require_enum(segment.gas_method, DiffType, method="set_diff_model", param="gas_method")
+        _require_enum(segment.ngl_method, DiffType, method="set_diff_model", param="ngl_method")
     conn.execute("DELETE FROM DiffModel WHERE diff_model_name = ?", (name,))
     for segment in sorted(segments, key=lambda item: item.start_date):
         conn.execute(
@@ -502,8 +521,10 @@ def set_diff_model(
         )
 
 
-def delete_diff_model(conn: sqlite3.Connection, name: str) -> None:
+def delete_diff_model(conn: sqlite3.Connection, name: str, *, confirm: bool = False) -> None:
     """Delete a shared differential model."""
+    if not confirm:
+        raise ValidationError("delete_diff_model: confirm=True is required")
     conn.execute("DELETE FROM DiffModel WHERE diff_model_name = ?", (name,))
 
 
@@ -513,11 +534,9 @@ def set_shrink_yield_model(
     *,
     gas_shrink_frac: float,
     ngl_yield_bbl_mmscf: float,
-    _allow_reserved_name: bool = False,
 ) -> None:
     """Replace a shared shrink/yield model."""
-    if not _allow_reserved_name:
-        reject_reserved_name(name, field="name", method="set_shrink_yield_model")
+    reject_reserved_name(name, field="name", method="set_shrink_yield_model")
     validate_percentage(gas_shrink_frac, field="gas_shrink_frac", method="set_shrink_yield_model")
     conn.execute("DELETE FROM ShrinkYieldModel WHERE shrink_yield_model_name = ?", (name,))
     conn.execute(
@@ -531,101 +550,11 @@ def set_shrink_yield_model(
     )
 
 
-def delete_shrink_yield_model(conn: sqlite3.Connection, name: str) -> None:
+def delete_shrink_yield_model(conn: sqlite3.Connection, name: str, *, confirm: bool = False) -> None:
     """Delete a shared shrink/yield model."""
+    if not confirm:
+        raise ValidationError("delete_shrink_yield_model: confirm=True is required")
     conn.execute("DELETE FROM ShrinkYieldModel WHERE shrink_yield_model_name = ?", (name,))
-
-
-def set_well_expense_model(
-    conn: sqlite3.Connection,
-    prop_id: str,
-    scenario: str,
-    segments: list[ExpenseModelSegment],
-) -> None:
-    """Replace a per-well expense model override and link it to a scenario."""
-    _require_well(conn, prop_id, method="set_well_expense_model")
-    _require_scenario(conn, scenario, method="set_well_expense_model")
-    model_name = _synthetic_model_name(prop_id, scenario)
-    set_expense_model(conn, model_name, segments, _allow_reserved_name=True)
-    set_well_models(conn, prop_id, scenario, exp_model=model_name)
-
-
-def delete_well_expense_model(conn: sqlite3.Connection, prop_id: str, scenario: str) -> None:
-    """Delete a per-well expense model override and clear the scenario link."""
-    model_name = _synthetic_model_name(prop_id, scenario)
-    delete_expense_model(conn, model_name)
-    _clear_well_model(conn, prop_id, scenario, "exp_model_name")
-
-
-def set_well_tax_model(
-    conn: sqlite3.Connection,
-    prop_id: str,
-    scenario: str,
-    segments: list[TaxModelSegment],
-) -> None:
-    """Replace a per-well tax model override and link it to a scenario."""
-    _require_well(conn, prop_id, method="set_well_tax_model")
-    _require_scenario(conn, scenario, method="set_well_tax_model")
-    model_name = _synthetic_model_name(prop_id, scenario)
-    set_tax_model(conn, model_name, segments, _allow_reserved_name=True)
-    set_well_models(conn, prop_id, scenario, tax_model=model_name)
-
-
-def delete_well_tax_model(conn: sqlite3.Connection, prop_id: str, scenario: str) -> None:
-    """Delete a per-well tax model override and clear the scenario link."""
-    model_name = _synthetic_model_name(prop_id, scenario)
-    delete_tax_model(conn, model_name)
-    _clear_well_model(conn, prop_id, scenario, "tax_model_name")
-
-
-def set_well_diff_model(
-    conn: sqlite3.Connection,
-    prop_id: str,
-    scenario: str,
-    segments: list[DiffModelSegment],
-) -> None:
-    """Replace a per-well differential model override and link it to a scenario."""
-    _require_well(conn, prop_id, method="set_well_diff_model")
-    _require_scenario(conn, scenario, method="set_well_diff_model")
-    model_name = _synthetic_model_name(prop_id, scenario)
-    set_diff_model(conn, model_name, segments, _allow_reserved_name=True)
-    set_well_models(conn, prop_id, scenario, diff_model=model_name)
-
-
-def delete_well_diff_model(conn: sqlite3.Connection, prop_id: str, scenario: str) -> None:
-    """Delete a per-well differential model override and clear the scenario link."""
-    model_name = _synthetic_model_name(prop_id, scenario)
-    delete_diff_model(conn, model_name)
-    _clear_well_model(conn, prop_id, scenario, "diff_model_name")
-
-
-def set_well_shrink_yield_model(
-    conn: sqlite3.Connection,
-    prop_id: str,
-    scenario: str,
-    *,
-    gas_shrink_frac: float,
-    ngl_yield_bbl_mmscf: float,
-) -> None:
-    """Replace a per-well shrink/yield model override and link it to a scenario."""
-    _require_well(conn, prop_id, method="set_well_shrink_yield_model")
-    _require_scenario(conn, scenario, method="set_well_shrink_yield_model")
-    model_name = _synthetic_model_name(prop_id, scenario)
-    set_shrink_yield_model(
-        conn,
-        model_name,
-        gas_shrink_frac=gas_shrink_frac,
-        ngl_yield_bbl_mmscf=ngl_yield_bbl_mmscf,
-        _allow_reserved_name=True,
-    )
-    set_well_models(conn, prop_id, scenario, shrink_yield_model=model_name)
-
-
-def delete_well_shrink_yield_model(conn: sqlite3.Connection, prop_id: str, scenario: str) -> None:
-    """Delete a per-well shrink/yield model override and clear the scenario link."""
-    model_name = _synthetic_model_name(prop_id, scenario)
-    delete_shrink_yield_model(conn, model_name)
-    _clear_well_model(conn, prop_id, scenario, "shrink_yield_model_name")
 
 
 def create_scenario(conn: sqlite3.Connection, name: str, *, copy_from: str | None = None) -> None:
@@ -783,9 +712,10 @@ def set_interest(
         _require_well(conn, prop_id, method="set_interest")
     starts = [segment.start for segment in segments]
     _require_unique_dates(starts, method="set_interest")
+    # Interest columns hold percentages from 0 to 100, e.g. 75.0 for 75%.
     for segment in segments:
-        validate_percentage(segment.wi_pct, field="wi_pct", method="set_interest")
-        validate_percentage(segment.nri_pct, field="nri_pct", method="set_interest")
+        validate_percent_0_100(segment.wi_pct, field="wi_pct", method="set_interest")
+        validate_percent_0_100(segment.nri_pct, field="nri_pct", method="set_interest")
     is_new_model = not _exists(conn, "Interest", "model", model)
     if is_new_model:
         all_prop_ids = _all_prop_ids(conn)
@@ -813,8 +743,8 @@ def delete_interest(
     confirm: bool = False,
 ) -> None:
     """Delete interest rows matching optional filters."""
-    if prop_ids is None and not confirm:
-        raise ValidationError("delete_interest: confirm=True is required when prop_ids is None")
+    if not confirm:
+        raise ValidationError("delete_interest: confirm=True is required")
     clauses: list[str] = []
     params: list[object] = []
     if prop_ids is not None:
@@ -835,6 +765,8 @@ def set_capex(conn: sqlite3.Connection, prop_id: str, model: str, items: list[Ca
     _require_well(conn, prop_id, method="set_capex")
     if not items:
         raise ValidationError("set_capex: items cannot be empty; use delete_capex to clear")
+    for item in items:
+        _require_enum(item.job_type, CapexJobType, method="set_capex", param="job_type")
     conn.execute("DELETE FROM Capex WHERE prop_id = ? AND model = ?", (prop_id, model))
     for item in sorted(items, key=lambda entry: entry.date):
         conn.execute(
@@ -861,8 +793,8 @@ def delete_capex(
     confirm: bool = False,
 ) -> None:
     """Delete capex rows matching optional filters."""
-    if prop_id is None and not confirm:
-        raise ValidationError("delete_capex: confirm=True is required when prop_id is None")
+    if not confirm:
+        raise ValidationError("delete_capex: confirm=True is required")
     clauses: list[str] = []
     params: list[object] = []
     if prop_id is not None:
@@ -877,7 +809,11 @@ def delete_capex(
 
 
 def set_abandonment(conn: sqlite3.Connection, prop_id: str, model: str, cost_gross: float) -> None:
-    """Replace one abandonment cost row."""
+    """Replace one abandonment cost row.
+
+    Every well carries an abandonment cost for each model; pass ``cost_gross=0.0``
+    to clear it rather than removing the row.
+    """
     reject_reserved_name(model, field="model", method="set_abandonment")
     _require_well(conn, prop_id, method="set_abandonment")
     conn.execute("DELETE FROM Abandonment WHERE prop_id = ? AND model = ?", (prop_id, model))
@@ -916,10 +852,10 @@ def set_surveys(conn: sqlite3.Connection, prop_id: str, points: list[SurveyPoint
 def delete_surveys(
     conn: sqlite3.Connection, prop_id: str | None = None, *, confirm: bool = False
 ) -> None:
-    """Delete survey rows for one well or, with confirmation, all wells."""
+    """Delete survey rows for one well or all wells."""
+    if not confirm:
+        raise ValidationError("delete_surveys: confirm=True is required")
     if prop_id is None:
-        if not confirm:
-            raise ValidationError("delete_surveys: confirm=True is required when prop_id is None")
         conn.execute("DELETE FROM Survey")
         return
     _require_well(conn, prop_id, method="delete_surveys")
@@ -936,16 +872,27 @@ def set_reservoir(
 ) -> None:
     """Upsert one reservoir row."""
     _require_well(conn, prop_id, method="set_reservoir")
-    conn.execute(
-        "DELETE FROM Reservoir WHERE prop_id = ? AND reservoir = ?",
+    exists = conn.execute(
+        "SELECT 1 FROM Reservoir WHERE prop_id = ? AND reservoir = ?",
         (prop_id, reservoir),
-    )
+    ).fetchone()
+    if exists is None:
+        conn.execute(
+            """
+            INSERT INTO Reservoir (prop_id, reservoir, top_depth_ft, gross_thickness_ft)
+            VALUES (?, ?, ?, ?)
+            """,
+            (prop_id, reservoir, top_depth_ft, thickness_ft),
+        )
+        return
+    # Update only the columns this writer owns so any other reservoir columns
+    # the database carries are preserved.
     conn.execute(
         """
-        INSERT INTO Reservoir (prop_id, reservoir, top_depth_ft, gross_thickness_ft)
-        VALUES (?, ?, ?, ?)
+        UPDATE Reservoir SET top_depth_ft = ?, gross_thickness_ft = ?
+        WHERE prop_id = ? AND reservoir = ?
         """,
-        (prop_id, reservoir, top_depth_ft, thickness_ft),
+        (top_depth_ft, thickness_ft, prop_id, reservoir),
     )
 
 
@@ -957,10 +904,8 @@ def delete_reservoir_data(
     confirm: bool = False,
 ) -> None:
     """Delete reservoir rows matching optional filters."""
-    if prop_id is None and not confirm:
-        raise ValidationError(
-            "delete_reservoir_data: confirm=True is required when prop_id is None"
-        )
+    if not confirm:
+        raise ValidationError("delete_reservoir_data: confirm=True is required")
     clauses: list[str] = []
     params: list[object] = []
     if prop_id is not None:
@@ -1032,10 +977,10 @@ def set_perfs(conn: sqlite3.Connection, prop_id: str, perfs: list[PerfsInput]) -
 def delete_perfs(
     conn: sqlite3.Connection, prop_id: str | None = None, *, confirm: bool = False
 ) -> None:
-    """Delete perforation rows for one well or, with confirmation, all wells."""
+    """Delete perforation rows for one well or all wells."""
+    if not confirm:
+        raise ValidationError("delete_perfs: confirm=True is required")
     if prop_id is None:
-        if not confirm:
-            raise ValidationError("delete_perfs: confirm=True is required when prop_id is None")
         conn.execute("DELETE FROM Perfs")
         return
     _require_well(conn, prop_id, method="delete_perfs")
@@ -1070,6 +1015,8 @@ def add_well_attribute_column(
     default: AttributeValue | None = None,
 ) -> None:
     """Add a user-defined WellAttributes column and backfill existing rows."""
+    _require_enum(attr_type, AttributeType, method="add_well_attribute_column", param="attr_type")
+    _ensure_well_attributes_table(conn)
     _validate_attribute_column_name(conn, name, method="add_well_attribute_column")
     db_default = _attribute_db_value(
         _default_for_attribute_type(attr_type) if default is None else default,
@@ -1097,6 +1044,14 @@ def delete_well_attribute_column(conn: sqlite3.Connection, name: str, *, confirm
         raise ValidationError("delete_well_attribute_column: confirm=True is required")
     _require_attribute_column(conn, name, method="delete_well_attribute_column")
     conn.execute(f"ALTER TABLE WellAttributes DROP COLUMN {quote_identifier(name)}")
+
+
+def _require_enum(value: object, enum_cls: type[StrEnum], *, method: str, param: str) -> None:
+    if not isinstance(value, enum_cls):
+        raise ValidationError(
+            f"{method}: {param} must be a {enum_cls.__name__} enum member "
+            f"(e.g. {enum_cls.__name__}.{next(iter(enum_cls)).name}), not {value!r}"
+        )
 
 
 def _main_values(prop_id: str, fields: Mapping[str, object], *, method: str) -> tuple[object, ...]:
@@ -1131,6 +1086,7 @@ def _require_unique_text(values: list[str], *, method: str, label: str) -> None:
 
 
 def _expense_model_type(segment: ExpenseModelSegment, *, method: str) -> str:
+    _require_enum(segment.kind, ExpenseModelKind, method=method, param="kind")
     return _kind_model_type(
         kind=segment.kind,
         age_months=segment.age_months,
@@ -1140,6 +1096,7 @@ def _expense_model_type(segment: ExpenseModelSegment, *, method: str) -> str:
 
 
 def _tax_model_type(segment: TaxModelSegment, *, method: str) -> str:
+    _require_enum(segment.kind, TaxModelKind, method=method, param="kind")
     return _kind_model_type(
         kind=segment.kind,
         age_months=segment.age_months,
@@ -1461,11 +1418,6 @@ def _require_model(
         )
 
 
-def _require_scenario(conn: sqlite3.Connection, scenario: str, *, method: str) -> None:
-    if not _exists(conn, "Scenario", "scenario", scenario):
-        raise ModelNotFoundError("Scenario", scenario, f"{method}: scenario {scenario!r} not found")
-
-
 def _warn_if_label_missing(
     conn: sqlite3.Connection, table: str, column: str, label: str, *, method: str
 ) -> None:
@@ -1499,14 +1451,23 @@ def _synthetic_model_name(prop_id: str, scenario: str) -> str:
     return f"{scenario}<>{prop_id}"
 
 
-def _clear_well_model(conn: sqlite3.Connection, prop_id: str, scenario: str, column: str) -> None:
+# Older databases may predate the WellAttributes table; create it the way the
+# Obsidian application does (prop_id plus a unique index, no user columns).
+def _ensure_well_attributes_table(conn: sqlite3.Connection) -> None:
+    if _table_exists(conn, "WellAttributes"):
+        return
+    conn.execute('CREATE TABLE "WellAttributes" (prop_id TEXT NOT NULL)')
     conn.execute(
-        f"UPDATE WellModels SET {quote_identifier(column)} = '' WHERE prop_id = ? AND scenario = ?",
-        (prop_id, scenario),
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_WellAttributes ON WellAttributes (prop_id)"
+    )
+    conn.executemany(
+        "INSERT INTO WellAttributes (prop_id) VALUES (?)",
+        [(prop_id,) for prop_id in sorted(_all_prop_ids(conn))],
     )
 
 
 def _insert_default_attributes(conn: sqlite3.Connection, prop_id: str) -> None:
+    _ensure_well_attributes_table(conn)
     columns = conn.execute("PRAGMA table_info(WellAttributes)").fetchall()
     names: list[str] = ["prop_id"]
     values: list[AttributeValue] = [prop_id]

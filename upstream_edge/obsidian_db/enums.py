@@ -23,9 +23,9 @@ class RsvCat(StrEnum):
 class Phase(StrEnum):
     """Production phase for forecasts."""
 
-    OIL = "Oil"
-    GAS = "Gas"
-    WATER = "Water"
+    OIL = "OIL"
+    GAS = "GAS"
+    WATER = "WATER"
 
 
 class CapexJobType(StrEnum):

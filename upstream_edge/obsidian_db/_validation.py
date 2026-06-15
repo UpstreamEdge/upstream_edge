@@ -42,4 +42,15 @@ def validate_month(value: date, *, field: str, method: str) -> None:
 
 def validate_percentage(value: float, *, field: str, method: str) -> None:
     if value < 0.0 or value > 1.0:
-        raise ValidationError(f"{method}: {field} must be between 0 and 1; got {value!r}")
+        raise ValidationError(
+            f"{method}: {field} must be a fraction between 0 and 1 "
+            f"(e.g. 0.75 for 75%); got {value!r}"
+        )
+
+
+def validate_percent_0_100(value: float, *, field: str, method: str) -> None:
+    if value < 0.0 or value > 100.0:
+        raise ValidationError(
+            f"{method}: {field} must be a percentage between 0 and 100 "
+            f"(e.g. 75.0 for 75%); got {value!r}"
+        )

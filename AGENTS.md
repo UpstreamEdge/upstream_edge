@@ -10,9 +10,11 @@
 
 A scenario groups forecast and economic-model assignments. `MAIN` is the default scenario created by Obsidian workflows.
 
-Price models are global commodity price decks. Expense, tax, differential, and shrink/yield models can be shared named models or per-well overrides linked through scenarios.
+Price models are global commodity price decks. Expense, tax, differential, and shrink/yield models are shared, named models that wells reference through scenarios via `set_well_models`.
 
 Well attributes are user-defined per-well columns.
+
+Interest values (`wi_pct`, `nri_pct`) are percentages from 0 to 100, e.g. 75.0 for 75%.
 
 ## Always Do / Never Do
 - Always wrap multi-row writes in `db.transaction()`.
@@ -26,9 +28,24 @@ Expense and tax segment kinds drive adjacent fields: `AGE_BASED` requires `age_m
 
 Monthly production dates must be the first day of the month.
 
+Forecast segments driven by a type curve carry the curve name in `type_curve` and have `None` for `rate_init`, `decline_init`, `b_factor`, and `decline_min` — handle both shapes when reading forecasts.
+
+`Database.open()` never creates files; it raises `FileNotFoundError` when the path does not exist.
+
 Whole-list `set_*` writers replace the full list under their natural key. Use the corresponding `delete_*` method when you intend to clear data.
 
+A few `set_*` writers patch rather than replace: `set_well_models`, `set_scenario`, `set_completion`, and `set_well_header` update only the fields you pass and leave the rest unchanged.
+
 Writers never accept `prop_ids=None` to mean all wells.
+
+## Errors
+All library errors subclass `ObsidianDbError`. The ones you will actually catch:
+- `DatabaseLockedError` — Obsidian (or more likely another process) holds the write lock. Close the database and retry.
+- `ModelNotFoundError` (`.model_kind`, `.name`) — a writer referenced a named model that does not exist.
+- `WellNotFoundError` (`.prop_id`) — a writer referenced a PropID absent from Main.
+- `ValidationError` — bad input: a raw string where an enum was required, a missing `confirm=True`, or no fields to write.
+- `DataIntegrityError` — existing database contents could not be interpreted (names the column).
+- `DuplicateError` — an `add_*` call targeted a key that already exists.
 
 ## Recommended Startup Sequence
 Open the database with `Database.open()`, identify the typed readers and writers needed, assemble dataclass inputs, then run related writes inside one transaction.
@@ -67,4 +84,4 @@ How do I inspect custom columns? Call `db.list_attribute_columns()`.
 
 How do I avoid partial writes? Use `with db.transaction():` around related operations.
 
-How do I delete broad data? Pass `confirm=True` and use the narrowest filter available.
+How do I delete data? Pass `confirm=True` and use the narrowest filter available.

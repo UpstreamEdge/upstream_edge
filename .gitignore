@@ -46,5 +46,8 @@ Thumbs.db
 *.db-wal
 *.sqlite
 *.sqlite3
+*.obsdb
+*.obsdb-shm
+*.obsdb-wal
 
 # Keep intentional fixture regeneration scripts and docs trackable.

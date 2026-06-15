@@ -11,7 +11,7 @@ If you've wanted to script a custom Obsidian integration with your data sources,
 
 - **No build tools or compilers.** `pip install upstream-edge` and you're done.
 - **Pandas if you want it.** Every reader has a `_df` sibling that returns a DataFrame. Skip the install and the library never touches pandas.
-- **Won't quietly break your database.** Writes that touch more than one table run in a transaction, bad inputs raise clear errors instead of corrupting state, and broad deletes require an explicit `confirm=True`.
+- **Won't quietly break your database.** Writes that touch more than one table run in a transaction, bad inputs raise clear errors instead of corrupting state, and every delete requires an explicit `confirm=True`.
 - **Plays well with AI assistants.** Claude, Cursor, Copilot, and the like can read the library's structured types and docstrings and write working scripts on your behalf.
 
 > **Using an AI assistant?** Point it at [`AGENTS.md`](AGENTS.md) before it writes any code. It's a one-read orientation doc — domain glossary, do's and don'ts, common pitfalls, and an FAQ — built specifically for agents driving this library.
@@ -86,9 +86,9 @@ If you haven't worked with an Obsidian database before, this is the vocabulary:
 - **Wells** are the unit of analysis. Each well has a `PropID` (the library's primary identifier) and optionally an `API10`. Wells carry header info — lease, operator, dates, location, reserve category — plus links to economic models.
 - **Production data** comes in two forms: monthly (keyed to the first of the month) and daily.
 - **Forecasts** are per-well, per-model, per-phase Arps declines. A `(prop_id, model, phase)` triple can hold multiple segments, each starting on a different date.
-- **Economic models** come in five forms — price, expense, tax, differential, shrink/yield — either as shared named models or as per-well overrides under a specific scenario.
+- **Economic models** come in five forms — price, expense, tax, differential, shrink/yield — written as shared, named models that wells reference through a scenario.
+- **Interest** (WI / NRI) and **Capex** schedules are per-well, per-model, with their own multi-segment shapes.
 - **Scenarios** group a set of economic-model assignments. The `MAIN` scenario always exists.
-- **Interest** (WI / NRI) and **capex** schedules are per-well, per-model, with their own multi-segment shapes.
 - **Well attributes** is a user-defined table — extra columns you add at runtime (text, numeric, or date).
 
 ---
@@ -107,11 +107,11 @@ db.path -> Path
 db.transaction() -> ContextManager[None]
 ```
 
-Opening gives you read/write access. Reads share the file with Obsidian normally. Write transactions raise `DatabaseLockedError` if Obsidian (or another process) is mid-write. Writers called outside a transaction get one implicitly; wrap multi-row work explicitly.
+Opening gives you read/write access. The path must be an existing database — `Database.open` raises `FileNotFoundError` rather than creating an empty file. Reads share the file with Obsidian normally. Write transactions raise `DatabaseLockedError` if Obsidian (or another process) is mid-write. Writers called outside a transaction get one implicitly; wrap multi-row work explicitly.
 
 ### Readers
 
-Every reader takes optional keyword filters; pass `None` to get all rows.
+Most readers are collection readers: they take optional filters (positional or keyword), and omitting them — or passing `None` — returns every row. The single-item lookups (`well`, `well_by_api`, `well_attributes`) instead take a required identifier and return one result or `None`.
 
 **Wells**
 
@@ -137,7 +137,7 @@ db.forecasts(prop_id: str | None = None, model: str | None = None) -> list[Forec
 **Economic models**
 
 ```python
-db.price_models(name: str | None = None) -> list[PriceModelSegment]
+db.price_models(name: str | None = None) -> list[PriceModel]
 db.expense_models(name: str | None = None) -> list[ExpenseModel]
 db.tax_models(name: str | None = None) -> list[TaxModel]
 db.diff_models(name: str | None = None) -> list[DiffModel]
@@ -151,8 +151,15 @@ db.well_models(prop_id: str | None = None, scenario: str | None = None) -> list[
 db.interest(prop_id: str | None = None, model: str | None = None) -> list[Interest]
 db.capex(prop_id: str | None = None, model: str | None = None) -> list[Capex]
 db.abandonment(prop_id: str | None = None, model: str | None = None) -> list[Abandonment]
+```
+
+**Scenarios**
+
+```python
 db.scenarios(name: str | None = None) -> list[Scenario]
 ```
+
+A `Scenario` row carries the scenario-level models — `forecast_model` and `price_model`. Per-well model links (expense, tax, diff, etc.) live in `well_models`, not here.
 
 **Reservoir and Subsurface**
 
@@ -173,7 +180,7 @@ db.all_well_attributes() -> dict[str, dict[str, str | float | date]]
 
 ### DataFrame adapter
 
-Every reader has a `_df` sibling that returns a pandas DataFrame:
+Every reader that returns a list or dict has a `_df` sibling that returns a pandas DataFrame (the single-well lookups `well` / `well_by_api` are the exception):
 
 ```python
 db.wells_df() -> pandas.DataFrame
@@ -253,7 +260,7 @@ Whole-list writers (`set_surveys`, `set_perfs`) replace every row for the prop_i
 ```python
 db.set_price_model(name: str, segments: list[PriceModelSegment]) -> None
 
-# General (named, shared) — any well can reference the same name.
+# Named, shared models — any well can reference the same name.
 db.set_expense_model(name: str, segments: list[ExpenseModelSegment]) -> None
 db.set_tax_model(name: str, segments: list[TaxModelSegment]) -> None
 db.set_diff_model(name: str, segments: list[DiffModelSegment]) -> None
@@ -261,24 +268,12 @@ db.set_shrink_yield_model(name: str, *,
                           gas_shrink_frac: float,
                           ngl_yield_bbl_mmscf: float) -> None
 
-# Per-well — override the general assignment for one well in one scenario.
-db.set_well_expense_model(prop_id: str, scenario: str,
-                          segments: list[ExpenseModelSegment]) -> None
-db.set_well_tax_model(prop_id: str, scenario: str,
-                      segments: list[TaxModelSegment]) -> None
-db.set_well_diff_model(prop_id: str, scenario: str,
-                       segments: list[DiffModelSegment]) -> None
-db.set_well_shrink_yield_model(prop_id: str, scenario: str, *,
-                               gas_shrink_frac: float,
-                               ngl_yield_bbl_mmscf: float) -> None
-
-db.delete_price_model(name: str) -> None
-db.delete_expense_model(name: str) -> None
-db.delete_well_expense_model(prop_id: str, scenario: str) -> None
+db.delete_price_model(name: str, *, confirm: bool = False) -> None
+db.delete_expense_model(name: str, *, confirm: bool = False) -> None
 # Same shape for tax / diff / shrink_yield.
 ```
 
-`set_*_model` writes a shared named model. `set_well_*_model` writes a per-well override and wires up the `WellModels` linkage for you.
+`set_*_model` writes a shared, named model; wells reference it by name through `set_well_models`.
 
 **Interest, capex, abandonment**
 
@@ -294,7 +289,9 @@ db.delete_capex(prop_id: str | None = None, model: str | None = None,
                 *, confirm: bool = False) -> None
 ```
 
-`set_interest` writes the same schedule to every well in `prop_ids` (single string or list).
+`set_interest` writes the same schedule to every well in `prop_ids` (single string or list). Interest values are percentages from 0 to 100, e.g. 75.0 for 75%.
+
+Every well keeps an abandonment cost for each model, so there is no `delete_abandonment` — call `set_abandonment(prop_id, model, 0.0)` to clear it.
 
 **Scenarios and well-to-model assignment**
 
@@ -389,13 +386,13 @@ Error messages name the method, the offending input, and the valid alternatives 
 ### Values and conventions
 
 - **Dates** use `datetime.date`. Monthly fields are keyed to the first of the month.
-- **Percentages** are decimals — `0.875` for 87.5%. Anything outside `[0, 1]` raises `ValidationError`.
+- **Percentages** use two conventions: severance/ad-valorem tax rates and `gas_shrink_frac` are fractions in `[0, 1]` (`0.046` for 4.6%); interest `wi_pct` / `nri_pct` run `0`–`100` (`75.0` for 75%). Out-of-range values raise `ValidationError`.
 - **Volumes**: oil in barrels (`bbl`), gas in MSCF, water in barrels. Daily rates use `bopd` / `mcfd` / `bwpd`.
 - **Identifiers**: `PropID` is a plain string; `API10` is exactly ten digits.
 - **Enums** round-trip as their `.value` string.
 - **Empty inputs** to whole-replace writers raise `ValidationError` and point at the corresponding `delete_*` method. Empty inputs to per-key upserts are a silent no-op.
 - **`set_*` is idempotent.** Safe to retry after a hiccup.
-- **Broad deletes** require `confirm=True`. The library would rather make you type one extra word than vaporize a quarter's work by accident.
+- **Every delete** requires `confirm=True`. The library would rather make you type one extra word than vaporize a quarter's work by accident.
 
 ### Logging
 
@@ -547,20 +544,6 @@ with Database.open("wells.obsdb") as db:
     )
 ```
 
-### Per-well expense model (one well, one scenario)
-
-```python
-with Database.open("wells.obsdb") as db:
-    db.set_well_expense_model(
-        "PROP_007", scenario="MAIN",
-        segments=[ExpenseModelSegment(
-            kind=ExpenseModelKind.SIMPLE,
-            fixed_monthly=4800.0,
-            variable_oil=6.20, variable_gas=0.45, variable_water=1.80,
-        )],
-    )
-```
-
 ### Single-segment Arps decline forecast
 
 ```python
@@ -663,8 +646,8 @@ from upstream_edge.obsidian_db import Database, InterestSegment
 
 prop_ids = [f"PROP_{i:03d}" for i in range(1, 201)]
 segments = [
-    InterestSegment(start=date(2026, 1, 1), wi_pct=1.00, nri_pct=0.75),
-    InterestSegment(start=date(2031, 1, 1), wi_pct=1.00, nri_pct=0.80),
+    InterestSegment(start=date(2026, 1, 1), wi_pct=100.0, nri_pct=75.0),
+    InterestSegment(start=date(2031, 1, 1), wi_pct=100.0, nri_pct=80.0),
 ]
 with Database.open("wells.obsdb") as db, db.transaction():
     db.set_interest(prop_ids, model="MAIN", segments=segments)
@@ -681,7 +664,7 @@ A few things make that work:
 - **[`AGENTS.md`](AGENTS.md)** ships at the repository root. It's a dense, agent-targeted bootstrap doc — domain glossary, do's and don'ts, common pitfalls, a startup sequence, and an FAQ. One read and the agent is oriented; you don't have to write the prompt yourself.
 - **Methods have typed signatures and source docstrings.** Agents can inspect the public API directly instead of guessing table names or row shapes.
 - **Errors point at the fix.** Misspell a field and the exception names the method, the bad value, and the valid alternatives when available.
-- **Broad destructive operations need `confirm=True`.** An agent can't quietly wipe a table; it has to name the flag.
+- **Destructive operations need `confirm=True`.** An agent can't quietly wipe data; it has to name the flag.
 
 A reasonable workflow for an agent: read `AGENTS.md`, open the database, then do its work inside a `transaction()`.
 

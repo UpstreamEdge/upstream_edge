@@ -1,22 +1,44 @@
 from __future__ import annotations
 
-from datetime import date
-
 import pytest
-from conftest import create_scenario_schema, seed_models
+from conftest import create_scenario_schema, exec_sql, seed_models
 
 from upstream_edge.obsidian_db import (
     Database,
-    DiffModelSegment,
-    DiffType,
-    ExpenseModelKind,
-    ExpenseModelSegment,
     ModelNotFoundError,
     RsvCat,
-    TaxModelKind,
-    TaxModelSegment,
     ValidationError,
 )
+
+
+def _seed_synthetic_expense_override(tmp_path_db, prop_id, scenario="MAIN"):
+    """Seed a legacy per-well "<>" expense override directly.
+
+    Obsidian historically wrote per-well overrides as shared-table rows named
+    "{scenario}<>{prop_id}". The library no longer creates them, but still has
+    to read around them, remap them on copy, and delete them — so tests insert
+    them by hand the way a real database would already carry them.
+    """
+    synthetic = f"{scenario}<>{prop_id}"
+    exec_sql(
+        tmp_path_db,
+        [
+            ("insert into Main (prop_id, rsv_cat) values (?, 'PDP')", (prop_id,)),
+            (
+                "insert into WellModels (prop_id, scenario, exp_model_name, capex_model_name, "
+                "diff_model_name, tax_model_name, shrink_yield_model_name, interest_model_name) "
+                "values (?, ?, ?, '', '', '', '', '')",
+                (prop_id, scenario, synthetic),
+            ),
+            (
+                "insert into ExpenseModel (exp_model_name, model_type, fixed_monthly, "
+                "variable_oil, variable_gas, variable_water) "
+                "values (?, 'SIMPLE', 10.0, 1.0, 2.0, 3.0)",
+                (synthetic,),
+            ),
+        ],
+    )
+    return synthetic
 
 
 def test_create_scenario_copy_and_delete(tmp_path):
@@ -108,96 +130,28 @@ def test_set_well_models_updates_named_models_and_warns_for_new_labels(tmp_path)
     assert row.interest_model == "MAIN"
 
 
-def test_per_well_economic_model_writers_link_synthetic_models(tmp_path):
+def test_legacy_synthetic_overrides_are_readable_and_filtered(tmp_path):
     db_path = tmp_path / "per_well_models.obsdb"
     create_scenario_schema(db_path)
     seed_models(db_path)
+    synthetic = _seed_synthetic_expense_override(db_path, "P1")
 
     with Database.open(db_path) as db:
-        db.add_well("P1", rsv_cat=RsvCat.PDP)
-
-        db.set_well_expense_model(
-            "P1",
-            "MAIN",
-            [
-                ExpenseModelSegment(
-                    kind=ExpenseModelKind.SIMPLE,
-                    fixed_monthly=10.0,
-                    variable_oil=1.0,
-                    variable_gas=2.0,
-                    variable_water=3.0,
-                )
-            ],
-        )
-        db.set_well_tax_model(
-            "P1",
-            "MAIN",
-            [
-                TaxModelSegment(
-                    kind=TaxModelKind.SIMPLE,
-                    sev_tax_oil=0.1,
-                    sev_tax_gas=0.1,
-                    sev_tax_ngl=0.1,
-                    ad_valorum_tax=0.1,
-                )
-            ],
-        )
-        db.set_well_diff_model(
-            "P1",
-            "MAIN",
-            [
-                DiffModelSegment(
-                    start_date=date(2026, 1, 1),
-                    oil_method=DiffType.DOLLAR,
-                    oil_diff=-1.0,
-                    gas_method=DiffType.FRACTION,
-                    gas_diff=0.9,
-                    ngl_method=DiffType.FRACTION,
-                    ngl_diff=0.5,
-                )
-            ],
-        )
-        db.set_well_shrink_yield_model(
-            "P1",
-            "MAIN",
-            gas_shrink_frac=0.1,
-            ngl_yield_bbl_mmscf=40.0,
-        )
-
-        synthetic = "MAIN<>P1"
-        row = db.well_models("P1", "MAIN")[0]
-        assert row.exp_model == synthetic
-        assert row.tax_model == synthetic
-        assert row.diff_model == synthetic
-        assert row.shrink_yield_model == synthetic
+        # Fetching a legacy override by its exact name still works.
         assert db.expense_models(synthetic)[0].fixed_monthly == 10.0
+        assert db.well_models("P1", "MAIN")[0].exp_model == synthetic
 
-        db.delete_well_expense_model("P1", "MAIN")
-        assert db.expense_models(synthetic) == []
-        assert db.well_models("P1", "MAIN")[0].exp_model == ""
+        # Synthetic per-well override names stay out of the unfiltered listing.
+        assert all("<>" not in model.name for model in db.expense_models())
 
 
 def test_copy_well_remaps_synthetic_model_overrides(tmp_path):
     db_path = tmp_path / "copy_well_synthetic.obsdb"
     create_scenario_schema(db_path)
     seed_models(db_path)
+    _seed_synthetic_expense_override(db_path, "P1")
 
     with Database.open(db_path) as db:
-        db.add_well("P1", rsv_cat=RsvCat.PDP)
-        db.set_well_expense_model(
-            "P1",
-            "MAIN",
-            [
-                ExpenseModelSegment(
-                    kind=ExpenseModelKind.SIMPLE,
-                    fixed_monthly=10.0,
-                    variable_oil=1.0,
-                    variable_gas=2.0,
-                    variable_water=3.0,
-                )
-            ],
-        )
-
         db.copy_well("P1", "P2")
 
         copied = db.well_models("P2", "MAIN")[0]
@@ -210,23 +164,9 @@ def test_delete_well_removes_synthetic_model_overrides(tmp_path):
     db_path = tmp_path / "delete_well_synthetic.obsdb"
     create_scenario_schema(db_path)
     seed_models(db_path)
+    _seed_synthetic_expense_override(db_path, "P1")
 
     with Database.open(db_path) as db:
-        db.add_well("P1", rsv_cat=RsvCat.PDP)
-        db.set_well_expense_model(
-            "P1",
-            "MAIN",
-            [
-                ExpenseModelSegment(
-                    kind=ExpenseModelKind.SIMPLE,
-                    fixed_monthly=10.0,
-                    variable_oil=1.0,
-                    variable_gas=2.0,
-                    variable_water=3.0,
-                )
-            ],
-        )
-
         db.delete_well("P1", confirm=True)
 
         assert db.expense_models("MAIN<>P1") == []
@@ -236,23 +176,9 @@ def test_create_scenario_copy_remaps_synthetic_model_overrides(tmp_path):
     db_path = tmp_path / "copy_scenario_synthetic.obsdb"
     create_scenario_schema(db_path)
     seed_models(db_path)
+    _seed_synthetic_expense_override(db_path, "P1")
 
     with Database.open(db_path) as db:
-        db.add_well("P1", rsv_cat=RsvCat.PDP)
-        db.set_well_expense_model(
-            "P1",
-            "MAIN",
-            [
-                ExpenseModelSegment(
-                    kind=ExpenseModelKind.SIMPLE,
-                    fixed_monthly=10.0,
-                    variable_oil=1.0,
-                    variable_gas=2.0,
-                    variable_water=3.0,
-                )
-            ],
-        )
-
         db.create_scenario("UPSIDE", copy_from="MAIN")
 
         copied = db.well_models("P1", "UPSIDE")[0]

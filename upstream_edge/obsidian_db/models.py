@@ -78,17 +78,21 @@ class DailyRow:
 
 @dataclass(frozen=True, slots=True)
 class Forecast:
-    """Forecast segment row."""
+    """Forecast segment row.
+
+    Segments driven by a type curve carry the curve name in ``type_curve`` and
+    may have no decline parameters of their own; the rate fields are then None.
+    """
 
     prop_id: str
     model: str
     phase: Phase
     start: date
     type_curve: str | None
-    rate_init: float
-    decline_init: float
-    b_factor: float
-    decline_min: float
+    rate_init: float | None
+    decline_init: float | None
+    b_factor: float | None
+    decline_min: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,7 +234,10 @@ class WellModels:
 
 @dataclass(frozen=True, slots=True)
 class Interest:
-    """Working-interest and net-revenue-interest segment."""
+    """Working-interest and net-revenue-interest segment.
+
+    ``wi_pct`` and ``nri_pct`` are percentages from 0 to 100 (e.g. 75.0 for 75%).
+    """
 
     prop_id: str
     model: str
@@ -241,7 +248,10 @@ class Interest:
 
 @dataclass(frozen=True, slots=True)
 class InterestSegment:
-    """Input segment for an interest schedule."""
+    """Input segment for an interest schedule.
+
+    ``wi_pct`` and ``nri_pct`` are percentages from 0 to 100 (e.g. 75.0 for 75%).
+    """
 
     start: date
     wi_pct: float
@@ -319,7 +329,7 @@ class Reservoir:
 
     prop_id: str
     reservoir: str
-    top_depth_ft: float
+    top_depth_ft: float | None
     thickness_ft: float | None
 
 
@@ -338,8 +348,8 @@ class Perfs:
     """Perforation interval row."""
 
     prop_id: str
-    perf_start_md_ft: float
-    perf_end_md_ft: float
+    perf_start_md_ft: float | None
+    perf_end_md_ft: float | None
     producing: bool
 
 

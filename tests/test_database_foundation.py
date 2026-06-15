@@ -9,12 +9,18 @@ from upstream_edge.obsidian_db import Database, RsvCat
 
 def test_open_close_context_and_path(tmp_path):
     db_path = tmp_path / "foundation.obsdb"
+    sqlite3.connect(db_path).close()
 
     with Database.open(db_path) as db:
         assert db.path == db_path
 
     with pytest.raises(RuntimeError, match="Database is closed"):
         _ = db.wells()
+
+
+def test_open_rejects_missing_file(tmp_path):
+    with pytest.raises(FileNotFoundError, match="does not create new files"):
+        Database.open(tmp_path / "missing.obsdb")
 
 
 def test_transaction_commits_and_rolls_back(tmp_path):
@@ -58,6 +64,7 @@ def test_transaction_commits_and_rolls_back(tmp_path):
 
 def test_nested_transaction_raises(tmp_path):
     db_path = tmp_path / "nested.obsdb"
+    sqlite3.connect(db_path).close()
 
     with Database.open(db_path) as db, db.transaction():
         with pytest.raises(RuntimeError, match="transaction already open"):
