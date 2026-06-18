@@ -24,6 +24,10 @@ Interest values (`wi_pct`, `nri_pct`) are percentages from 0 to 100, e.g. 75.0 f
 - Never open the SQLite file with `sqlite3.connect()` directly for writes; use the typed API so invariants are preserved.
 
 ## Common Pitfalls
+Model assignment has two tiers, and forecast and price models sit in a different tier than the rest. Forecast and price models are **scenario-global** — one of each applies to every well in the scenario — so they are set with `set_scenario(scenario, forecast_model=..., price_model=...)` and read from the `Scenario` row. The other model kinds (expense, tax, diff, shrink/yield, capex, interest) are **per-well** and are set with `set_well_models(prop_ids, scenario, ...)` and read from `well_models`. `set_well_models` has no `forecast_model` or `price_model` parameter on purpose; reaching for it to assign those is the usual wrong turn.
+
+Assigning a forecast or price model is two steps. `set_forecast(prop_id, model=..., ...)` and `set_price_model(name, ...)` only *store* the curve or deck under a name; nothing is applied until a scenario points at that name with `set_scenario`. To read what a scenario actually uses, read the name from `scenarios()` first, then pass it to `forecasts(model=...)` or `price_models(name=...)`.
+
 Expense and tax segment kinds drive adjacent fields: `AGE_BASED` requires `age_months`, `DATE_BASED` requires `effective_date`, and `SIMPLE` rejects both.
 
 Monthly production dates must be the first day of the month.
@@ -72,9 +76,26 @@ db.set_monthly_prod(rows)
 
 One `API10` may map to more than one `PropID`; build `dict[str, list[str]]` and fan out the rows if your data needs to land on every match.
 
-How do I link a well to a model? Call `db.set_well_models(prop_ids, scenario="MAIN", exp_model="STD_OPEX")`.
+How do I link a well to a model? Call `db.set_well_models(prop_ids, scenario="MAIN", exp_model="STD_OPEX")`. This covers the per-well kinds (expense, tax, diff, shrink/yield, capex, interest) only.
 
-What happens if a referenced named model does not exist? The writer raises `ModelNotFoundError` before writing.
+How do I set the forecast or price model for a scenario? Use `set_scenario`, not `set_well_models` — these two are scenario-global. Build the curve or deck first, then point the scenario at it by name:
+
+```python
+with db.transaction():
+    db.set_forecast("PROP_001", model="BASE", phase=Phase.OIL, segments=[...])
+    db.set_price_model("STRIP_2026", [...])
+    db.set_scenario("MAIN", forecast_model="BASE", price_model="STRIP_2026")
+```
+
+How do I read the forecast or price model a scenario actually uses? Read the name off the scenario, then look it up:
+
+```python
+sc = db.scenarios("MAIN")[0]
+curves = db.forecasts("PROP_001", model=sc.forecast_model)
+deck = db.price_models(sc.price_model)
+```
+
+What happens if a referenced named model does not exist? The writer raises `ModelNotFoundError` before writing. (`set_scenario` is the one nuance: a missing `price_model` is a hard error, but a missing `forecast_model` only warns, since forecast model names are labels you may populate later.)
 
 How do I create a new well? Call `db.add_well(prop_id, rsv_cat=RsvCat.PUD, ...)`.
 

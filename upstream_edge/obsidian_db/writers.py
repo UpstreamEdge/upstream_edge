@@ -316,7 +316,11 @@ def set_forecast(
     phase: Phase,
     segments: list[ForecastSegment],
 ) -> None:
-    """Replace forecast segments for one PropID/model/phase."""
+    """Replace forecast segments for one PropID/model/phase.
+
+    ``model`` is a forecast-model name. The curve is not applied until a
+    scenario references the name through ``set_scenario(forecast_model=...)``.
+    """
     _require_enum(phase, Phase, method="set_forecast", param="phase")
     _require_well(conn, prop_id, method="set_forecast")
     if not segments:
@@ -382,7 +386,12 @@ def delete_forecast(
 
 
 def set_price_model(conn: sqlite3.Connection, name: str, segments: list[PriceModelSegment]) -> None:
-    """Replace a price model with one or more segments."""
+    """Replace a price model with one or more segments.
+
+    Stores a named, shared deck only. It is applied to a scenario's wells
+    globally via ``set_scenario(price_model=name)``; there is no per-well price
+    assignment.
+    """
     reject_reserved_name(name, field="name", method="set_price_model")
     _require_segments(segments, method="set_price_model", delete_method="delete_price_model")
     _require_unique_dates([segment.start_date for segment in segments], method="set_price_model")
@@ -619,7 +628,14 @@ def set_scenario(
     forecast_model: str | None = None,
     price_model: str | None = None,
 ) -> None:
-    """Partially update a scenario's forecast and price model names."""
+    """Partially update a scenario's forecast and price model names.
+
+    Forecast and price models are applied globally to every well in the
+    scenario, so they are assigned here rather than per well in
+    ``set_well_models``. ``price_model`` must name an existing deck (hard error
+    otherwise); a missing ``forecast_model`` only warns, since it is a label in
+    the Forecast table that may be populated later.
+    """
     if forecast_model is None and price_model is None:
         raise ValidationError("set_scenario: at least one field must be specified")
     if not _exists(conn, "Scenario", "scenario", name):
@@ -652,7 +668,11 @@ def set_well_models(
     shrink_yield_model: str | None = None,
     interest_model: str | None = None,
 ) -> None:
-    """Partially update per-well model assignments for a scenario."""
+    """Partially update per-well model assignments for a scenario.
+
+    Handles the six per-well model kinds only. The scenario-global forecast and
+    price models are assigned through ``set_scenario``, not here.
+    """
     updates = {
         "exp_model_name": exp_model,
         "capex_model_name": capex_model,

@@ -220,7 +220,11 @@ class ShrinkYieldModel:
 
 @dataclass(frozen=True, slots=True)
 class WellModels:
-    """Per-well scenario model assignment."""
+    """Per-well scenario model assignment.
+
+    Holds the per-well model kinds. The scenario-global forecast and price
+    models are not here — see :class:`Scenario`.
+    """
 
     prop_id: str
     scenario: str
@@ -291,7 +295,13 @@ class Abandonment:
 
 @dataclass(frozen=True, slots=True)
 class Scenario:
-    """Scenario registry row."""
+    """Scenario registry row.
+
+    ``forecast_model`` and ``price_model`` are applied globally to every well in
+    the scenario. ``forecast_model`` names the ``model`` used by ``set_forecast``;
+    ``price_model`` names a deck from ``set_price_model``. The per-well model
+    kinds live in :class:`WellModels`.
+    """
 
     name: str
     forecast_model: str

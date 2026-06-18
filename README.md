@@ -85,10 +85,11 @@ If you haven't worked with an Obsidian database before, this is the vocabulary:
 - **Databases** are SQLite files, conventionally with the `.obsdb` extension.
 - **Wells** are the unit of analysis. Each well has a `PropID` (the library's primary identifier) and optionally an `API10`. Wells carry header info — lease, operator, dates, location, reserve category — plus links to economic models.
 - **Production data** comes in two forms: monthly (keyed to the first of the month) and daily.
-- **Forecasts** are per-well, per-model, per-phase Arps declines. A `(prop_id, model, phase)` triple can hold multiple segments, each starting on a different date.
-- **Economic models** come in five forms — price, expense, tax, differential, shrink/yield — written as shared, named models that wells reference through a scenario.
+- **Forecasts** are per-well, per-model, per-phase Arps declines. A `(prop_id, model, phase)` triple can hold multiple segments, each starting on a different date. `model` here is a forecast-model *name*; a scenario applies one such name to all its wells.
+- **Economic models** come in five forms — price, expense, tax, differential, shrink/yield — written as shared, named models. They attach to wells in two different ways (see below).
+- **Model assignment has two tiers.** **Forecast** and **price** models are *scenario-global*: one of each applies to every well in the scenario, set with `set_scenario`. **Expense, tax, differential, shrink/yield** (plus capex and interest) are *per-well within a scenario*, set with `set_well_models`. The split is deliberate — `set_well_models` has no forecast or price parameter.
 - **Interest** (WI / NRI) and **Capex** schedules are per-well, per-model, with their own multi-segment shapes.
-- **Scenarios** group a set of economic-model assignments. The `MAIN` scenario always exists.
+- **Scenarios** group these assignments: the scenario-global forecast and price models live on the scenario itself, while the per-well model links live in `well_models`. The `MAIN` scenario always exists.
 - **Well attributes** is a user-defined table — extra columns you add at runtime (text, numeric, or date).
 
 ---
@@ -474,6 +475,39 @@ with Database.open("wells.obsdb") as db:
         PriceModelSegment(date(2027, 1, 1), oil=70.00, gas=3.20, ngl=23.00),
         PriceModelSegment(date(2028, 1, 1), oil=68.00, gas=3.10, ngl=22.00),
     ])
+```
+
+### Apply a forecast and price deck to a scenario
+
+Forecast and price models are scenario-global: build them under a name, then point the scenario at that name. (Use `set_scenario`, not `set_well_models` — the latter handles only the per-well model kinds.)
+
+```python
+from datetime import date
+from upstream_edge.obsidian_db import (
+    Database, ForecastSegment, Phase, PriceModelSegment,
+)
+
+with Database.open("wells.obsdb") as db:
+    with db.transaction():
+        # 1. Store the curve under a forecast-model name and the deck under its name.
+        db.set_forecast("PROP_001", model="BASE", phase=Phase.OIL, segments=[
+            ForecastSegment(start=date(2026, 6, 1), rate_init=450.0,
+                            decline_init=0.65, b_factor=1.1, decline_min=0.06),
+        ])
+        db.set_price_model("STRIP_2026", [
+            PriceModelSegment(date(2026, 1, 1), oil=72.50, gas=3.40, ngl=24.10),
+        ])
+        # 2. Apply both to the scenario — globally, for every well in it.
+        db.set_scenario("MAIN", forecast_model="BASE", price_model="STRIP_2026")
+```
+
+To read back what a scenario actually uses, resolve the name through the scenario:
+
+```python
+with Database.open("wells.obsdb") as db:
+    sc = db.scenarios("MAIN")[0]
+    curves = db.forecasts("PROP_001", model=sc.forecast_model)
+    deck = db.price_models(sc.price_model)
 ```
 
 ### Simple expense model assigned to a scenario

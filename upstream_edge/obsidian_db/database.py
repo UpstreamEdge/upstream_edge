@@ -266,7 +266,12 @@ class Database:
         return _pandas.from_dataclass_rows(self.production_daily(prop_id), DailyRow)
 
     def forecasts(self, prop_id: str | None = None, model: str | None = None) -> list[Forecast]:
-        """Return forecast segments with optional PropID and model filters."""
+        """Return forecast segments with optional PropID and model filters.
+
+        ``model`` is a forecast-model name, not a scenario. To read the curves a
+        scenario actually uses, first read its ``forecast_model`` from
+        ``scenarios()`` and pass that as ``model``.
+        """
         return readers.forecasts(self._ensure_open(), prop_id, model)
 
     def forecasts_df(self, prop_id: str | None = None, model: str | None = None):
@@ -274,7 +279,11 @@ class Database:
         return _pandas.from_dataclass_rows(self.forecasts(prop_id, model), Forecast)
 
     def price_models(self, name: str | None = None) -> list[PriceModel]:
-        """Return price model segments, optionally filtered by name."""
+        """Return price model segments, optionally filtered by name.
+
+        To read the deck a scenario actually uses, first read its ``price_model``
+        from ``scenarios()`` and pass that as ``name``.
+        """
         return readers.price_models(self._ensure_open(), name)
 
     def price_models_df(self, name: str | None = None):
@@ -316,7 +325,12 @@ class Database:
     def well_models(
         self, prop_id: str | None = None, scenario: str | None = None
     ) -> list[WellModels]:
-        """Return per-well scenario model assignments."""
+        """Return per-well scenario model assignments.
+
+        Covers the per-well model kinds (expense, tax, diff, shrink/yield, capex,
+        interest). The scenario-global forecast and price models are not here —
+        read those from ``scenarios``.
+        """
         return readers.well_models(self._ensure_open(), prop_id, scenario)
 
     def well_models_df(self, prop_id: str | None = None, scenario: str | None = None):
@@ -350,7 +364,11 @@ class Database:
         return _pandas.from_dataclass_rows(self.abandonment(prop_id, model), Abandonment)
 
     def scenarios(self, name: str | None = None) -> list[Scenario]:
-        """Return scenarios, optionally filtered by name."""
+        """Return scenarios, optionally filtered by name.
+
+        Each row carries the scenario-global ``forecast_model`` and
+        ``price_model``. The per-well model kinds live in ``well_models``.
+        """
         return readers.scenarios(self._ensure_open(), name)
 
     def scenarios_df(self, name: str | None = None):
@@ -460,7 +478,14 @@ class Database:
     def set_forecast(
         self, prop_id: str, model: str, phase: Phase, segments: list[ForecastSegment]
     ) -> None:
-        """Replace forecast segments for one PropID/model/phase."""
+        """Replace forecast segments for one PropID/model/phase.
+
+        ``model`` is a forecast-model name, not a scenario. Writing segments
+        here only stores the curve; it is not applied until a scenario points at
+        the name via ``set_scenario(scenario, forecast_model=model)``. One model
+        name can hold curves for many wells, and a scenario applies that whole
+        named set globally.
+        """
         with self._write_context() as conn:
             writers.set_forecast(conn, prop_id, model, phase, segments)
 
@@ -477,7 +502,13 @@ class Database:
             writers.delete_forecast(conn, prop_id, model, phase, confirm=confirm)
 
     def set_price_model(self, name: str, segments: list[PriceModelSegment]) -> None:
-        """Replace a price model with one or more segments."""
+        """Replace a price model with one or more segments.
+
+        This stores a named, shared price deck; it does not assign it to anyone.
+        A price model is applied globally to a scenario's wells via
+        ``set_scenario(scenario, price_model=name)`` — there is no per-well price
+        assignment.
+        """
         with self._write_context() as conn:
             writers.set_price_model(conn, name, segments)
 
@@ -554,7 +585,21 @@ class Database:
         forecast_model: str | None = None,
         price_model: str | None = None,
     ) -> None:
-        """Partially update a scenario's forecast and price model names."""
+        """Set a scenario's forecast and price models.
+
+        Forecast and price models are applied globally to every well in the
+        scenario, so they live here on the scenario rather than per well. This
+        is the only writer that assigns them — they are deliberately absent from
+        ``set_well_models``, which handles the per-well model kinds (expense,
+        tax, diff, shrink/yield, capex, interest).
+
+        Both ``forecast_model`` and ``price_model`` are names. ``forecast_model``
+        points at the ``model`` used by ``set_forecast``; ``price_model`` points
+        at a deck created by ``set_price_model``. A missing ``price_model`` is a
+        hard error (it is a named entity), while a missing ``forecast_model``
+        only warns (it is a label in the Forecast table that you may populate
+        later). This is a partial update — only the kwargs you pass are written.
+        """
         with self._write_context() as conn:
             writers.set_scenario(conn, name, forecast_model=forecast_model, price_model=price_model)
 
@@ -570,7 +615,13 @@ class Database:
         shrink_yield_model: str | None = None,
         interest_model: str | None = None,
     ) -> None:
-        """Partially update per-well model assignments for a scenario."""
+        """Set the per-well model assignments for a scenario.
+
+        These six model kinds are assigned per well within a scenario. The two
+        scenario-global kinds — forecast and price — are *not* set here; use
+        ``set_scenario`` for those. This is a partial update: only the kwargs
+        you pass are written, and the rest are left unchanged.
+        """
         with self._write_context() as conn:
             writers.set_well_models(
                 conn,

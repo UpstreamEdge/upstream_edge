@@ -3,6 +3,12 @@
 All notable changes to `upstream-edge` are documented in this file.
 
 
+## 1.1.1
+- Clearer docs on model assignment: forecast and price models are scenario-global
+  (set with `set_scenario`), while expense, tax, diff, and shrink/yield are
+  per-well (set with `set_well_models`). README, `AGENTS.md`, and method
+  docstrings now spell out the distinction.
+
 ## 1.1.0
 - Readers now handle every native data format, including `YYYYMM` production
   months, uppercase forecast phases, type-curve forecast segments, and blank
