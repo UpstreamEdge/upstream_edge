@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import date
 
 import pytest
-from conftest import create_model_schema
+from conftest import create_model_schema, exec_sql
 
 from upstream_edge.obsidian_db import (
     Database,
@@ -114,3 +115,112 @@ def test_shared_model_validation(tmp_path):
                     )
                 ],
             )
+
+
+def test_condensate_columns_survive_a_rewrite(tmp_path):
+    # Obsidian's DiffModel and ShrinkYieldModel carry condensate values this
+    # library does not expose. Both writers delete and reinsert, so hardcoding
+    # the condensate columns wiped whatever Obsidian had stored. They must be
+    # carried across instead, per start_date for the diff model.
+    db_path = tmp_path / "condensate.obsdb"
+    create_model_schema(db_path)
+
+    with Database.open(db_path) as db:
+        db.set_diff_model(
+            "DIFF",
+            [
+                DiffModelSegment(
+                    start_date=date(2026, 1, 1),
+                    oil_method=DiffType.DOLLAR,
+                    oil_diff=-2.0,
+                    gas_method=DiffType.FRACTION,
+                    gas_diff=0.9,
+                    ngl_method=DiffType.FRACTION,
+                    ngl_diff=0.5,
+                ),
+                DiffModelSegment(
+                    start_date=date(2027, 1, 1),
+                    oil_method=DiffType.DOLLAR,
+                    oil_diff=-2.5,
+                    gas_method=DiffType.FRACTION,
+                    gas_diff=0.85,
+                    ngl_method=DiffType.FRACTION,
+                    ngl_diff=0.45,
+                ),
+            ],
+        )
+        db.set_shrink_yield_model("SY", gas_shrink_frac=0.12, ngl_yield_bbl_mmscf=45.0)
+
+    # Stand in for Obsidian setting the condensate side. The 2027 segment is
+    # left on its defaults so both the carried and the untouched case are
+    # covered.
+    exec_sql(
+        db_path,
+        [
+            (
+                "UPDATE DiffModel SET condensate_diff_method = ?, condensate_diff = ? "
+                "WHERE diff_model_name = ? AND start_date = ?",
+                ("DOLLAR", -3.25, "DIFF", "2026-01-01"),
+            ),
+            (
+                "UPDATE ShrinkYieldModel SET condensate_yield_bbl_mmscf = ? "
+                "WHERE shrink_yield_model_name = ?",
+                (12.5, "SY"),
+            ),
+        ],
+    )
+
+    with Database.open(db_path) as db:
+        # Rewrite both models, changing only what the library exposes. The new
+        # 2028 segment has no prior row and must land on Obsidian's defaults.
+        db.set_diff_model(
+            "DIFF",
+            [
+                DiffModelSegment(
+                    start_date=date(2026, 1, 1),
+                    oil_method=DiffType.DOLLAR,
+                    oil_diff=-1.0,
+                    gas_method=DiffType.FRACTION,
+                    gas_diff=0.95,
+                    ngl_method=DiffType.FRACTION,
+                    ngl_diff=0.55,
+                ),
+                DiffModelSegment(
+                    start_date=date(2028, 1, 1),
+                    oil_method=DiffType.DOLLAR,
+                    oil_diff=-4.0,
+                    gas_method=DiffType.FRACTION,
+                    gas_diff=0.8,
+                    ngl_method=DiffType.FRACTION,
+                    ngl_diff=0.4,
+                ),
+            ],
+        )
+        db.set_shrink_yield_model("SY", gas_shrink_frac=0.2, ngl_yield_bbl_mmscf=50.0)
+
+        # The exposed edit landed.
+        assert db.diff_models("DIFF")[0].oil_diff == -1.0
+        assert db.shrink_yield_models("SY")[0].gas_shrink_frac == 0.2
+
+    conn = sqlite3.connect(db_path)
+    try:
+        diffs = {
+            str(row[0]): (str(row[1]), row[2])
+            for row in conn.execute(
+                "SELECT start_date, condensate_diff_method, condensate_diff FROM DiffModel "
+                "WHERE diff_model_name = ?",
+                ("DIFF",),
+            ).fetchall()
+        }
+        shrink = conn.execute(
+            "SELECT condensate_yield_bbl_mmscf FROM ShrinkYieldModel "
+            "WHERE shrink_yield_model_name = ?",
+            ("SY",),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert diffs["2026-01-01"] == ("DOLLAR", -3.25)  # carried, not wiped
+    assert diffs["2028-01-01"] == ("FRACTION", 0.0)  # new row, Obsidian's default
+    assert "2027-01-01" not in diffs  # dropped segment really is gone
+    assert shrink[0] == 12.5

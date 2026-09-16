@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 from conftest import create_scenario_schema, exec_sql, seed_models
 
@@ -184,3 +186,43 @@ def test_create_scenario_copy_remaps_synthetic_model_overrides(tmp_path):
         copied = db.well_models("P1", "UPSIDE")[0]
         assert copied.exp_model == "UPSIDE<>P1"
         assert db.expense_models("UPSIDE<>P1")[0].fixed_monthly == 10.0
+
+
+def test_create_scenario_copy_carries_obsidian_only_columns(tmp_path):
+    # Obsidian's Scenario table carries per-scenario new-well defaults this
+    # library does not expose. Naming only the two known columns in the copy
+    # silently dropped them, so the copy is driven off the table's real column
+    # list instead.
+    db_path = tmp_path / "scenario_defaults.obsdb"
+    create_scenario_schema(db_path)
+    seed_models(db_path)
+    exec_sql(
+        db_path,
+        [
+            'alter table Scenario add column "default_exp_model" text',
+            'alter table Scenario add column "default_wi" real',
+            'alter table Scenario add column "default_cost_template" text',
+            (
+                "update Scenario set default_exp_model = ?, default_wi = ?, "
+                "default_cost_template = ? where scenario = ?",
+                ("OPEX", 87.5, "HZ_WOLFCAMP", "MAIN"),
+            ),
+        ],
+    )
+
+    with Database.open(db_path) as db:
+        db.create_scenario("UPSIDE", copy_from="MAIN")
+        # The columns the library does expose still copy.
+        assert db.scenarios("UPSIDE")[0].price_model == "STRIP"
+
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            'SELECT "default_exp_model", "default_wi", "default_cost_template" '
+            "FROM Scenario WHERE scenario = ?",
+            ("UPSIDE",),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row == ("OPEX", 87.5, "HZ_WOLFCAMP")

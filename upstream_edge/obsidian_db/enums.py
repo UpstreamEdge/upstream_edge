@@ -7,6 +7,7 @@ class RsvCat(StrEnum):
     """Reserve category stored on a well header."""
 
     PDP = "PDP"
+    PDNP = "PDNP"
     SHUT_IN = "ShutIn"
     DUC = "DUC"
     PUD = "PUD"

@@ -211,7 +211,7 @@ db.copy_well(from_prop_id: str, to_prop_id: str) -> None
 db.delete_well(prop_id: str, *, confirm: bool) -> None
 ```
 
-`add_well` creates the well so it is immediately usable; follow with `set_interest`, `set_abandonment`, `set_well_models`, or `set_well_attribute` to customize as needed.
+`add_well` creates the well so it is immediately usable: every model assignment starts on `MAIN`, the same default a well created inside Obsidian gets. Follow with `set_interest`, `set_abandonment`, `set_well_models`, or `set_well_attribute` to customize as needed.
 
 **Production**
 
@@ -327,7 +327,8 @@ db.rename_well_attribute_column(old: str, new: str) -> None
 db.delete_well_attribute_column(name: str, *, confirm: bool) -> None
 ```
 
-Adding a column backfills the default for every existing well.
+Adding a column backfills the default for every existing well, and the default
+is stored on the column itself, so wells added later in Obsidian get it too.
 
 ### Row dataclasses
 
@@ -342,7 +343,7 @@ All row types are immutable.
 ### Enums
 
 ```python
-RsvCat       = PDP | SHUT_IN | DUC | PUD | PROB | POSS |
+RsvCat       = PDP | PDNP | SHUT_IN | DUC | PUD | PROB | POSS |
                LOC | TA | PA | SWD | UNSPECIFIED | DATA
 Phase        = OIL | GAS | WATER
 CapexJobType = DRILLING | COMPLETIONS | FACILITIES | SURFACE_WORK |

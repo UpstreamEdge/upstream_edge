@@ -196,6 +196,35 @@ def test_reader_rejects_unknown_enum(tmp_path):
             db.wells()
 
 
+def test_reader_accepts_every_rsv_cat_value(tmp_path):
+    # Every category Obsidian can write to Main.rsv_cat must read back. A value
+    # missing from the enum is not a soft failure here: the reader raises
+    # DataIntegrityError and the whole wells() call fails, so one unlisted
+    # category makes the database unreadable (PDNP did exactly that).
+    db_path = tmp_path / "all_cats.obsdb"
+    exec_sql(
+        db_path,
+        [
+            MAIN_SCHEMA,
+            *[
+                (
+                    "insert into Main (prop_id, rsv_cat) values (?, ?)",
+                    (f"P{index}", category.value),
+                )
+                for index, category in enumerate(RsvCat)
+            ],
+        ],
+    )
+
+    with Database.open(db_path) as db:
+        wells = db.wells()
+
+    assert {w.rsv_cat for w in wells} == set(RsvCat)
+    # Spot-check the exact spellings Obsidian writes, which are not all the
+    # member names.
+    assert {"PDP", "PDNP", "ShutIn", "P&A", "Blank"} <= {c.value for c in RsvCat}
+
+
 def test_reservoir_and_perf_readers_allow_null_depths(tmp_path):
     db_path = tmp_path / "null_depths.obsdb"
     exec_sql(

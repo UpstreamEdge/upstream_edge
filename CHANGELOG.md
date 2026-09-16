@@ -3,6 +3,10 @@
 All notable changes to `upstream-edge` are documented in this file.
 
 
+## 1.2.0
+- Add `RsvCat` `PDNP` variant
+- Improve default economic model assignment/handling
+
 ## 1.1.1
 - Clearer docs on model assignment: forecast and price models are scenario-global
   (set with `set_scenario`), while expense, tax, diff, and shrink/yield are

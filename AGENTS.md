@@ -6,7 +6,7 @@
 ## Domain Glossary
 `PropID` is the primary well identifier used by the library. `API10` is an optional ten-digit regulatory identifier and may map to more than one PropID.
 
-`RsvCat` is the reserve category stored on each well: PDP, ShutIn, DUC, PUD, PROB, POSS, LOC, TA, P&A, SWD, Blank, Data.
+`RsvCat` is the reserve category stored on each well: PDP, PDNP, ShutIn, DUC, PUD, PROB, POSS, LOC, TA, P&A, SWD, Blank, Data.
 
 A scenario groups forecast and economic-model assignments. `MAIN` is the default scenario created by Obsidian workflows.
 

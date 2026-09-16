@@ -41,6 +41,13 @@ def test_add_well_writes_default_cascade(tmp_path):
 
     assert well is not None
     assert well.well_name == "MITCHELL 1H"
+    # Every model kind starts on MAIN, the same default Obsidian gives a well
+    # created inside the application; a blank name never resolves there.
+    assert well_models.exp_model == "MAIN"
+    assert well_models.capex_model == "MAIN"
+    assert well_models.diff_model == "MAIN"
+    assert well_models.tax_model == "MAIN"
+    assert well_models.shrink_yield_model == "MAIN"
     assert well_models.interest_model == "MAIN"
     assert interest.wi_pct == 100.0
     assert interest.nri_pct == 75.0

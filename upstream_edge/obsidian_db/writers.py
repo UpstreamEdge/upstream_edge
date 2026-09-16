@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 import warnings
 from collections.abc import Mapping, Sequence
@@ -115,7 +116,13 @@ def add_well(
     api_10: str | None = None,
     header_fields: Mapping[str, object],
 ) -> None:
-    """Insert a Main row for a new well."""
+    """Insert a Main row for a new well.
+
+    Every model assignment starts as ``MAIN``, the same default Obsidian gives a
+    well created inside the application. A blank model name never resolves in
+    Obsidian (a blank expense model means *zero* expenses), so the defaults are
+    written here rather than left for the caller.
+    """
     _require_enum(rsv_cat, RsvCat, method="add_well", param="rsv_cat")
     validate_api10(api_10, method="add_well")
     if _exists(conn, "Main", "prop_id", prop_id):
@@ -132,7 +139,7 @@ def add_well(
         INSERT INTO WellModels (
             prop_id, scenario, exp_model_name, capex_model_name, diff_model_name,
             tax_model_name, shrink_yield_model_name, interest_model_name
-        ) VALUES (?, 'MAIN', '', 'MAIN', '', '', '', 'MAIN')
+        ) VALUES (?, 'MAIN', 'MAIN', 'MAIN', 'MAIN', 'MAIN', 'MAIN', 'MAIN')
         """,
         (prop_id,),
     )
@@ -498,7 +505,13 @@ def set_diff_model(
     name: str,
     segments: list[DiffModelSegment],
 ) -> None:
-    """Replace a shared differential model."""
+    """Replace a shared differential model.
+
+    Obsidian's DiffModel also carries a condensate differential, which this
+    library does not expose. Because the write is a delete-and-reinsert, the
+    existing condensate values are carried across per ``start_date`` rather than
+    reset, so editing a model here leaves the condensate side as Obsidian set it.
+    """
     reject_reserved_name(name, field="name", method="set_diff_model")
     _require_segments(segments, method="set_diff_model", delete_method="delete_diff_model")
     _require_unique_dates([segment.start_date for segment in segments], method="set_diff_model")
@@ -506,8 +519,23 @@ def set_diff_model(
         _require_enum(segment.oil_method, DiffType, method="set_diff_model", param="oil_method")
         _require_enum(segment.gas_method, DiffType, method="set_diff_model", param="gas_method")
         _require_enum(segment.ngl_method, DiffType, method="set_diff_model", param="ngl_method")
+    existing_condensate = {
+        str(row["start_date"]): (row["condensate_diff_method"], row["condensate_diff"])
+        for row in conn.execute(
+            """
+            SELECT start_date, condensate_diff_method, condensate_diff
+            FROM DiffModel WHERE diff_model_name = ?
+            """,
+            (name,),
+        ).fetchall()
+    }
     conn.execute("DELETE FROM DiffModel WHERE diff_model_name = ?", (name,))
     for segment in sorted(segments, key=lambda item: item.start_date):
+        # A segment on a start_date the model did not have before gets the same
+        # defaults Obsidian's own schema applies to a new row.
+        condensate_method, condensate_diff = existing_condensate.get(
+            segment.start_date.isoformat(), (DiffType.FRACTION.value, 0.0)
+        )
         conn.execute(
             """
             INSERT INTO DiffModel (
@@ -524,8 +552,8 @@ def set_diff_model(
                 segment.gas_diff,
                 segment.ngl_method.value,
                 segment.ngl_diff,
-                "FRACTION",
-                0.0,
+                condensate_method,
+                condensate_diff,
             ),
         )
 
@@ -544,9 +572,20 @@ def set_shrink_yield_model(
     gas_shrink_frac: float,
     ngl_yield_bbl_mmscf: float,
 ) -> None:
-    """Replace a shared shrink/yield model."""
+    """Replace a shared shrink/yield model.
+
+    Obsidian's ShrinkYieldModel also carries a condensate yield, which this
+    library does not expose. The existing value is carried across rather than
+    reset, so editing a model here leaves it as Obsidian set it.
+    """
     reject_reserved_name(name, field="name", method="set_shrink_yield_model")
     validate_percentage(gas_shrink_frac, field="gas_shrink_frac", method="set_shrink_yield_model")
+    existing = conn.execute(
+        "SELECT condensate_yield_bbl_mmscf FROM ShrinkYieldModel WHERE shrink_yield_model_name = ?",
+        (name,),
+    ).fetchone()
+    # Obsidian's schema defaults a new row's condensate yield to 0.0.
+    condensate_yield = 0.0 if existing is None else existing["condensate_yield_bbl_mmscf"]
     conn.execute("DELETE FROM ShrinkYieldModel WHERE shrink_yield_model_name = ?", (name,))
     conn.execute(
         """
@@ -555,7 +594,7 @@ def set_shrink_yield_model(
             condensate_yield_bbl_mmscf
         ) VALUES (?, ?, ?, ?)
         """,
-        (name, gas_shrink_frac, ngl_yield_bbl_mmscf, 0.0),
+        (name, gas_shrink_frac, ngl_yield_bbl_mmscf, condensate_yield),
     )
 
 
@@ -577,8 +616,19 @@ def create_scenario(conn: sqlite3.Connection, name: str, *, copy_from: str | Non
             (name,),
         )
         return
+    # Copy every column the Scenario table actually has, not just the two this
+    # library exposes. Obsidian stores its per-scenario new-well defaults here
+    # (default_exp_model, default_wi, ...), and naming only the known columns
+    # silently dropped them from the copy.
+    source_columns = [
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(Scenario)").fetchall()
+        if str(row["name"]) != "scenario"
+    ]
+    selected = ", ".join(quote_identifier(column) for column in source_columns)
     source = conn.execute(
-        "SELECT forecast_model_name, price_model_name FROM Scenario WHERE scenario = ?",
+        f"SELECT {selected} FROM Scenario WHERE scenario = ?" if selected
+        else "SELECT scenario FROM Scenario WHERE scenario = ?",
         (copy_from,),
     ).fetchone()
     if source is None:
@@ -587,9 +637,13 @@ def create_scenario(conn: sqlite3.Connection, name: str, *, copy_from: str | Non
             copy_from,
             f"create_scenario(copy_from={copy_from!r}): source scenario does not exist",
         )
+    insert_columns = ", ".join(
+        quote_identifier(column) for column in ("scenario", *source_columns)
+    )
+    placeholders = ", ".join("?" * (len(source_columns) + 1))
     conn.execute(
-        "INSERT INTO Scenario (scenario, forecast_model_name, price_model_name) VALUES (?, ?, ?)",
-        (name, source["forecast_model_name"], source["price_model_name"]),
+        f"INSERT INTO Scenario ({insert_columns}) VALUES ({placeholders})",
+        (name, *(source[column] for column in source_columns)),
     )
     conn.execute(
         """
@@ -1034,7 +1088,12 @@ def add_well_attribute_column(
     attr_type: AttributeType,
     default: AttributeValue | None = None,
 ) -> None:
-    """Add a user-defined WellAttributes column and backfill existing rows."""
+    """Add a user-defined WellAttributes column and backfill existing rows.
+
+    The default is stored on the column itself, matching the DDL Obsidian emits,
+    so rows written later — including by Obsidian — pick it up rather than
+    landing on NULL.
+    """
     _require_enum(attr_type, AttributeType, method="add_well_attribute_column", param="attr_type")
     _ensure_well_attributes_table(conn)
     _validate_attribute_column_name(conn, name, method="add_well_attribute_column")
@@ -1043,10 +1102,15 @@ def add_well_attribute_column(
         attr_type=attr_type,
         method="add_well_attribute_column",
     )
+    # NOT NULL DEFAULT matches the DDL Obsidian itself emits, and SQLite
+    # backfills existing rows with the default, so no follow-up UPDATE is
+    # needed. Without the default, a row Obsidian inserts later leaves this
+    # column NULL; Obsidian's loader substitutes the type default, but the
+    # caller's chosen default would have been silently lost.
     conn.execute(
-        f"ALTER TABLE WellAttributes ADD COLUMN {quote_identifier(name)} {_attribute_sql_type(attr_type)}"
+        f"ALTER TABLE WellAttributes ADD COLUMN {quote_identifier(name)} "
+        f"{_attribute_sql_type(attr_type)} NOT NULL DEFAULT {_sql_literal(db_default)}"
     )
-    conn.execute(f"UPDATE WellAttributes SET {quote_identifier(name)} = ?", (db_default,))
 
 
 def rename_well_attribute_column(conn: sqlite3.Connection, old: str, new: str) -> None:
@@ -1205,6 +1269,19 @@ def _validate_attribute_column_name(conn: sqlite3.Connection, name: str, *, meth
         raise ValidationError(f"{method}: WellAttributes column {name!r} already exists")
 
 
+def _sql_literal(value: str | float) -> str:
+    """Render a validated attribute default as a SQL literal.
+
+    SQLite does not accept a bound parameter in ``ADD COLUMN ... DEFAULT``, so
+    the value has to be inlined. Only values that already passed
+    ``_attribute_db_value`` reach here, meaning a float or a str.
+    """
+    if isinstance(value, str):
+        escaped = value.replace("'", "''")
+        return f"'{escaped}'"
+    return repr(float(value))
+
+
 def _attribute_sql_type(attr_type: AttributeType) -> str:
     if attr_type is AttributeType.NUMERIC:
         return "REAL"
@@ -1227,6 +1304,10 @@ def _attribute_db_value(
     if attr_type is AttributeType.NUMERIC:
         if not isinstance(value, float):
             raise ValidationError(f"{method}: NUMERIC WellAttributes values must be float")
+        if not math.isfinite(value):
+            raise ValidationError(
+                f"{method}: NUMERIC WellAttributes values must be finite, got {value!r}"
+            )
         return value
     if attr_type is AttributeType.DATE:
         if not isinstance(value, date):
@@ -1461,7 +1542,7 @@ def _ensure_well_models_row(conn: sqlite3.Connection, prop_id: str, scenario: st
         INSERT INTO WellModels (
             prop_id, scenario, exp_model_name, capex_model_name, diff_model_name,
             tax_model_name, shrink_yield_model_name, interest_model_name
-        ) VALUES (?, ?, '', 'MAIN', '', '', '', 'MAIN')
+        ) VALUES (?, ?, 'MAIN', 'MAIN', 'MAIN', 'MAIN', 'MAIN', 'MAIN')
         """,
         (prop_id, scenario),
     )
