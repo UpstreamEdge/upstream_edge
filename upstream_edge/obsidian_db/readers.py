@@ -7,6 +7,7 @@ from datetime import date
 from enum import StrEnum
 from typing import TypeVar
 
+from ._sql import missing_table_name
 from .enums import (
     CapexJobType,
     DiffType,
@@ -15,7 +16,7 @@ from .enums import (
     RsvCat,
     TaxModelKind,
 )
-from .exceptions import DataIntegrityError
+from .exceptions import DataIntegrityError, MissingTableError
 from .models import (
     Abandonment,
     Capex,
@@ -650,6 +651,9 @@ def _query(
     try:
         return list(conn.execute(query, params).fetchall())
     except sqlite3.OperationalError as exc:
+        table = missing_table_name(exc)
+        if table is not None:
+            raise MissingTableError(table) from exc
         raise DataIntegrityError(f"SQLite operation failed for reader query: {exc}") from exc
 
 

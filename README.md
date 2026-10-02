@@ -213,6 +213,8 @@ db.delete_well(prop_id: str, *, confirm: bool) -> None
 
 `add_well` creates the well so it is immediately usable: every model assignment starts on `MAIN`, the same default a well created inside Obsidian gets. Follow with `set_interest`, `set_abandonment`, `set_well_models`, or `set_well_attribute` to customize as needed.
 
+`delete_well` and `copy_well` cover the well's Main row, its rows in Monthly, Daily, Forecast, WellModels, Interest, Capex, Abandonment, Survey, Reservoir, Completion, Perfs and WellAttributes, a couple of rarely used per-well tables, and its individual econ models. Tables newer Obsidian versions key by PropID are left alone.
+
 **Production**
 
 ```python
@@ -328,7 +330,9 @@ db.delete_well_attribute_column(name: str, *, confirm: bool) -> None
 ```
 
 Adding a column backfills the default for every existing well, and the default
-is stored on the column itself, so wells added later in Obsidian get it too.
+is stored on the column itself, so wells added later with `add_well` start with
+it too. Obsidian gives a well it adds the type default instead: 0, 2000-01-01,
+or empty text.
 
 ### Row dataclasses
 
@@ -377,6 +381,7 @@ All inherit from `ObsidianDbError`.
 |---|---|
 | `DatabaseLockedError` | Another process holds the SQLite write lock during a write transaction. |
 | `DataIntegrityError` | The database contains data the library can't interpret (e.g. missing column). |
+| `MissingTableError` | A `DataIntegrityError`: the database has no table the call needs, usually because it predates that table (see [Older databases](#older-databases)). Carries `.table`. |
 | `WellNotFoundError` | A PropID you referenced doesn't exist. Carries `.prop_id`. |
 | `ModelNotFoundError` | A named model you referenced doesn't exist. Carries `.model_kind` and `.name`. |
 | `DuplicateError` | An `add_*` was called for a key that already exists. |
@@ -395,6 +400,25 @@ Error messages name the method, the offending input, and the valid alternatives 
 - **Empty inputs** to whole-replace writers raise `ValidationError` and point at the corresponding `delete_*` method. Empty inputs to per-key upserts are a silent no-op.
 - **`set_*` is idempotent.** Safe to retry after a hiccup.
 - **Every delete** requires `confirm=True`. The library would rather make you type one extra word than vaporize a quarter's work by accident.
+
+### Older databases
+
+Obsidian adds every table its current version uses each time it opens a
+database. A file last saved by an older Obsidian, or a new blank database
+written from Python before Obsidian has loaded it, can be missing some of them.
+
+- A missing `WellAttributes` table is handled for you: `add_well` and
+  `add_well_attribute_column` create it, with a row for every existing well.
+  Until then the attribute readers return no attributes, and the other
+  attribute writers raise `ValidationError` for an unknown column, since a file
+  with no table has no attribute columns.
+- `delete_well` and `copy_well` skip any of their tables the file does not
+  have, `WellModels` included.
+- Any other read or write that needs a missing table raises `MissingTableError`
+  and writes nothing. Open the file once in Obsidian, then retry.
+
+To build a database from scratch, create it with Obsidian's **Blank Database**
+button. Current Obsidian versions write every current table into the new file.
 
 ### Logging
 

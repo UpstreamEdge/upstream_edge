@@ -11,8 +11,9 @@ from pathlib import Path
 from types import TracebackType
 
 from . import _pandas, attributes, readers, writers
+from ._sql import missing_table_name
 from .enums import AttributeType, Phase, RsvCat
-from .exceptions import DatabaseLockedError
+from .exceptions import DatabaseLockedError, MissingTableError
 from .models import (
     Abandonment,
     AttributeColumn,
@@ -175,11 +176,19 @@ class Database:
     @contextmanager
     def _write_context(self) -> Generator[sqlite3.Connection, None, None]:
         conn = self._ensure_open()
-        if self._transaction_open:
-            yield conn
-            return
-        with self._transaction():
-            yield conn
+        # Translated outside `_transaction`, so a write this opened has already
+        # rolled back; inside the caller's transaction, theirs rolls back.
+        try:
+            if self._transaction_open:
+                yield conn
+                return
+            with self._transaction():
+                yield conn
+        except sqlite3.OperationalError as exc:
+            table = missing_table_name(exc)
+            if table is None:
+                raise
+            raise MissingTableError(table) from exc
 
     def wells(self) -> list[Well]:
         """Return all well headers ordered by PropID.
@@ -441,12 +450,21 @@ class Database:
             )
 
     def delete_well(self, prop_id: str, *, confirm: bool) -> None:
-        """Delete a well and all rows keyed by its PropID."""
+        """Delete a well, its rows in the per-well tables, and its individual econ models.
+
+        The per-well tables are Monthly, Daily, Forecast, WellModels, Interest,
+        Capex, Abandonment, Survey, Reservoir, Completion, Perfs, WellAttributes
+        and a couple of rarely used ones; one the file does not have is skipped.
+        """
         with self._write_context() as conn:
             writers.delete_well(conn, prop_id, confirm=confirm)
 
     def copy_well(self, from_prop_id: str, to_prop_id: str) -> None:
-        """Copy one well and all rows keyed by its PropID."""
+        """Copy a well, its rows in the per-well tables, and its individual econ models.
+
+        The per-well tables are the ones `delete_well` clears; one the file does
+        not have is skipped.
+        """
         with self._write_context() as conn:
             writers.copy_well(conn, from_prop_id, to_prop_id)
 

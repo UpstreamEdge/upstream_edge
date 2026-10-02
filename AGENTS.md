@@ -42,6 +42,12 @@ A few `set_*` writers patch rather than replace: `set_well_models`, `set_scenari
 
 Writers never accept `prop_ids=None` to mean all wells.
 
+A database can be missing tables until Obsidian next opens it: a file last saved by an older Obsidian, or a new Blank Database written from Python first. A missing `WellAttributes` table is handled for you: `add_well` and `add_well_attribute_column` create it, the attribute readers return no attributes, and the other attribute writers raise `ValidationError` for an unknown column (add the column first). `delete_well` and `copy_well` skip any of their tables the file does not have. Anything else that needs a missing table raises `MissingTableError` and writes nothing.
+
+`delete_well` and `copy_well` cover Main, Monthly, Daily, Forecast, WellModels, Interest, Capex, Abandonment, Survey, Reservoir, Completion, Perfs, WellAttributes, a couple of rarely used per-well tables and the well's individual econ models, not every table with a `prop_id` column.
+
+A new `WellAttributes` row (from `add_well`, or `set_well_attribute` on a well with no row) takes each column's declared default. Obsidian gives wells it adds the type default instead. To build a database from scratch, have the user create it with Obsidian's Blank Database button.
+
 ## Errors
 All library errors subclass `ObsidianDbError`. The ones you will actually catch:
 - `DatabaseLockedError` — Obsidian (or more likely another process) holds the write lock. Close the database and retry.
@@ -49,6 +55,7 @@ All library errors subclass `ObsidianDbError`. The ones you will actually catch:
 - `WellNotFoundError` (`.prop_id`) — a writer referenced a PropID absent from Main.
 - `ValidationError` — bad input: a raw string where an enum was required, a missing `confirm=True`, or no fields to write.
 - `DataIntegrityError` — existing database contents could not be interpreted (names the column).
+- `MissingTableError` (`.table`, a `DataIntegrityError`) — the file has no table the call needs, usually because it predates it. Tell the user to open the file once in Obsidian, which adds every current table, then retry. Never create the table yourself with `sqlite3`.
 - `DuplicateError` — an `add_*` call targeted a key that already exists.
 
 ## Recommended Startup Sequence

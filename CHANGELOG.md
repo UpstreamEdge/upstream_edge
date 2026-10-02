@@ -3,6 +3,11 @@
 All notable changes to `upstream-edge` are documented in this file.
 
 
+## 1.2.1
+- Fix `add_well` and other well writers on databases missing newer tables
+- New `MissingTableError` for a call that needs a table the database does not
+  have yet; it says to open the file once in Obsidian
+
 ## 1.2.0
 - Add `RsvCat` `PDNP` variant
 - Improve default economic model assignment/handling

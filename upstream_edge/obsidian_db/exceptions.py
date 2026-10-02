@@ -13,6 +13,26 @@ class DataIntegrityError(ObsidianDbError):
     """Raised when database contents or schema cannot be interpreted."""
 
 
+class MissingTableError(DataIntegrityError):
+    """Raised when an operation needs a table the database file does not have.
+
+    Obsidian adds every table its current version uses each time it opens a
+    database, so this almost always means the file predates that table: it was
+    last saved by an older Obsidian, or built by another tool.
+    """
+
+    def __init__(self, table: str, message: str | None = None) -> None:
+        self.table = table
+        super().__init__(
+            message
+            or (
+                f"table {table!r} is missing: this database predates the current "
+                "Obsidian schema, or was not created by Obsidian. Open it once in "
+                "Obsidian, which adds every current table, then retry."
+            )
+        )
+
+
 class WellNotFoundError(ObsidianDbError):
     """Raised when a writer references a PropID absent from Main."""
 

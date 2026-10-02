@@ -83,6 +83,25 @@ _SYNTHETIC_MODEL_SPECS: tuple[tuple[str, str, str, str], ...] = (
     ),
 )
 
+# The per-well tables, besides Main, that `delete_well` clears and `copy_well`
+# copies. Tables newer Obsidian versions key by PropID are not among them.
+_WELL_TABLES: tuple[str, ...] = (
+    "Monthly",
+    "Daily",
+    "Forecast",
+    "WellModels",
+    "Interest",
+    "Capex",
+    "Abandonment",
+    "Survey",
+    "Reservoir",
+    "Completion",
+    "Casing",
+    "Perfs",
+    "PredictorAssignment",
+    "WellAttributes",
+)
+
 HEADER_FIELD_TO_SQL: dict[str, str] = {
     "api_10": "api_10",
     "rsv_cat": "rsv_cat",
@@ -131,6 +150,12 @@ def add_well(
     fields["api_10"] = api_10
     fields["rsv_cat"] = rsv_cat
     values = _main_values(prop_id, fields, method="add_well")
+    # Before the Main insert: creating the table (on a file that predates it)
+    # gives every well already in Main its row, and the new well gets its row
+    # from `_insert_default_attributes` below. Created after the insert, the
+    # backfill would add the new well's row too, and the second insert would
+    # fail the table's unique index.
+    _ensure_well_attributes_table(conn)
     placeholders = ", ".join("?" for _ in MAIN_COLUMNS)
     columns = ", ".join(quote_identifier(column) for column in MAIN_COLUMNS)
     conn.execute(f"INSERT INTO Main ({columns}) VALUES ({placeholders})", values)
@@ -151,54 +176,46 @@ def add_well(
         "INSERT INTO Abandonment (prop_id, model, cost_gross) VALUES (?, 'MAIN', 100000.0)",
         (prop_id,),
     )
+    # A row can outlive its well when Main is edited directly. Obsidian drops
+    # such rows when it loads the file; drop it here so the new well starts
+    # from defaults instead of inheriting the old well's values.
+    conn.execute("DELETE FROM WellAttributes WHERE prop_id = ?", (prop_id,))
     _insert_default_attributes(conn, prop_id)
 
 
 def delete_well(conn: sqlite3.Connection, prop_id: str, *, confirm: bool) -> None:
-    """Delete a well and all rows keyed by its PropID."""
+    """Delete a well: its Main row, its rows in the per-well tables, and its
+    individual econ models.
+
+    The per-well tables are Monthly, Daily, Forecast, WellModels, Interest,
+    Capex, Abandonment, Survey, Reservoir, Completion, Casing, Perfs,
+    PredictorAssignment and WellAttributes. One the file does not have (it was
+    last saved by an older Obsidian) holds no rows for the well and is skipped.
+    """
     if not confirm:
         raise ValidationError("delete_well: confirm=True is required")
     _require_well(conn, prop_id, method="delete_well")
     _delete_synthetic_models_for_well(conn, prop_id)
-    for table in (
-        "Monthly",
-        "Daily",
-        "Forecast",
-        "WellModels",
-        "Interest",
-        "Capex",
-        "Abandonment",
-        "Survey",
-        "Reservoir",
-        "Completion",
-        "Perfs",
-        "WellAttributes",
-    ):
-        conn.execute(f"DELETE FROM {quote_identifier(table)} WHERE prop_id = ?", (prop_id,))
+    for table in _WELL_TABLES:
+        if _table_exists(conn, table):
+            conn.execute(f"DELETE FROM {quote_identifier(table)} WHERE prop_id = ?", (prop_id,))
     conn.execute("DELETE FROM Main WHERE prop_id = ?", (prop_id,))
 
 
 def copy_well(conn: sqlite3.Connection, from_prop_id: str, to_prop_id: str) -> None:
-    """Copy one well and all rows keyed by its PropID."""
+    """Copy a well: its Main row, its rows in the per-well tables, and its
+    individual econ models, all under the new PropID.
+
+    The per-well tables are the ones `delete_well` clears. One the file does not
+    have is skipped.
+    """
     _require_well(conn, from_prop_id, method="copy_well")
     if _exists(conn, "Main", "prop_id", to_prop_id):
         raise DuplicateError(f"copy_well(to_prop_id={to_prop_id!r}): PropID already exists")
-    for table in (
-        "Main",
-        "Monthly",
-        "Daily",
-        "Forecast",
-        "WellModels",
-        "Interest",
-        "Capex",
-        "Abandonment",
-        "Survey",
-        "Reservoir",
-        "Completion",
-        "Perfs",
-        "WellAttributes",
-    ):
-        _copy_prop_id_rows(conn, table, from_prop_id, to_prop_id)
+    _copy_prop_id_rows(conn, "Main", from_prop_id, to_prop_id)
+    for table in _WELL_TABLES:
+        if _table_exists(conn, table):
+            _copy_prop_id_rows(conn, table, from_prop_id, to_prop_id)
     _copy_synthetic_models_for_well(conn, from_prop_id, to_prop_id)
 
 
@@ -1064,10 +1081,17 @@ def delete_perfs(
 def set_well_attribute(
     conn: sqlite3.Connection, prop_id: str, column: str, value: AttributeValue
 ) -> None:
-    """Set one WellAttributes cell."""
+    """Set one WellAttributes cell.
+
+    A well with no WellAttributes row (one added to Main by another tool) gets
+    one first, with the same defaults `add_well` gives a new well, so the value
+    is stored rather than the update matching nothing.
+    """
     _require_well(conn, prop_id, method="set_well_attribute")
     attr_type = _require_attribute_column(conn, column, method="set_well_attribute")
     db_value = _attribute_db_value(value, attr_type=attr_type, method="set_well_attribute")
+    if not _exists(conn, "WellAttributes", "prop_id", prop_id):
+        _insert_default_attributes(conn, prop_id)
     conn.execute(
         f"UPDATE WellAttributes SET {quote_identifier(column)} = ? WHERE prop_id = ?",
         (db_value, prop_id),
@@ -1091,8 +1115,8 @@ def add_well_attribute_column(
     """Add a user-defined WellAttributes column and backfill existing rows.
 
     The default is stored on the column itself, matching the DDL Obsidian emits,
-    so rows written later — including by Obsidian — pick it up rather than
-    landing on NULL.
+    so wells this library adds later start with it too. Obsidian gives a well it
+    adds the type default (0, 2000-01-01 or empty) instead.
     """
     _require_enum(attr_type, AttributeType, method="add_well_attribute_column", param="attr_type")
     _ensure_well_attributes_table(conn)
@@ -1104,9 +1128,8 @@ def add_well_attribute_column(
     )
     # NOT NULL DEFAULT matches the DDL Obsidian itself emits, and SQLite
     # backfills existing rows with the default, so no follow-up UPDATE is
-    # needed. Without the default, a row Obsidian inserts later leaves this
-    # column NULL; Obsidian's loader substitutes the type default, but the
-    # caller's chosen default would have been silently lost.
+    # needed. `_insert_default_attributes` relies on the declared default for
+    # wells added later.
     conn.execute(
         f"ALTER TABLE WellAttributes ADD COLUMN {quote_identifier(name)} "
         f"{_attribute_sql_type(attr_type)} NOT NULL DEFAULT {_sql_literal(db_default)}"
@@ -1243,7 +1266,21 @@ def _attribute_type_from_sql(sql_type: str) -> AttributeType:
 def _require_attribute_column(
     conn: sqlite3.Connection, column: str, *, method: str
 ) -> AttributeType:
+    # A file with no WellAttributes table has no attribute columns either:
+    # Obsidian creates the table without any, so it is an unknown column, not a
+    # missing table.
+    if not _table_exists(conn, "WellAttributes"):
+        raise ValidationError(
+            f"{method}: unknown WellAttributes column {column!r}. The database has no "
+            "WellAttributes table yet, so it has no attribute columns; "
+            "add_well_attribute_column creates the table and adds the column"
+        )
     columns = _attribute_column_types(conn)
+    if not columns:
+        raise ValidationError(
+            f"{method}: unknown WellAttributes column {column!r}. The database has no "
+            "attribute columns yet; add one with add_well_attribute_column"
+        )
     if column not in columns:
         valid = ", ".join(sorted(columns))
         raise ValidationError(
@@ -1355,6 +1392,9 @@ def _copy_prop_id_rows(
 
 
 def _delete_synthetic_models_for_well(conn: sqlite3.Connection, prop_id: str) -> None:
+    # Without WellModels no individual model is assigned to the well.
+    if not _table_exists(conn, "WellModels"):
+        return
     rows = conn.execute("SELECT scenario FROM WellModels WHERE prop_id = ?", (prop_id,)).fetchall()
     for row in rows:
         _delete_synthetic_model_set(conn, _synthetic_model_name(prop_id, str(row["scenario"])))
@@ -1373,6 +1413,8 @@ def _delete_synthetic_model_set(conn: sqlite3.Connection, model_name: str) -> No
 def _copy_synthetic_models_for_well(
     conn: sqlite3.Connection, from_prop_id: str, to_prop_id: str
 ) -> None:
+    if not _table_exists(conn, "WellModels"):
+        return
     rows = conn.execute(
         "SELECT * FROM WellModels WHERE prop_id = ? ORDER BY scenario", (to_prop_id,)
     ).fetchall()
@@ -1567,14 +1609,20 @@ def _ensure_well_attributes_table(conn: sqlite3.Connection) -> None:
     )
 
 
+# The table must already exist; `add_well` creates it before touching Main.
+# A column with a declared default is left out of the insert so SQLite applies
+# it; one without (an older column, or one added by another tool) gets its type
+# default.
 def _insert_default_attributes(conn: sqlite3.Connection, prop_id: str) -> None:
-    _ensure_well_attributes_table(conn)
     columns = conn.execute("PRAGMA table_info(WellAttributes)").fetchall()
     names: list[str] = ["prop_id"]
     values: list[AttributeValue] = [prop_id]
     for column in columns:
         name = str(column["name"])
         if name.lower() == "prop_id":
+            continue
+        declared_default = column["dflt_value"]
+        if declared_default is not None and str(declared_default).upper() != "NULL":
             continue
         names.append(name)
         values.append(_default_attribute_value(str(column["type"])))
