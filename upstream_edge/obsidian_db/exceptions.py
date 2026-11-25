@@ -9,6 +9,13 @@ class DatabaseLockedError(ObsidianDbError):
     """Raised when SQLite cannot acquire the write lock."""
 
 
+class ReadOnlyDatabaseError(ObsidianDbError):
+    """Raised when a write is attempted on a database that was opened read-only.
+
+    ``Database.open(path, read_only=True)`` opens a file this way.
+    """
+
+
 class DataIntegrityError(ObsidianDbError):
     """Raised when database contents or schema cannot be interpreted."""
 
@@ -60,3 +67,26 @@ class ValidationError(ObsidianDbError):
 
 class MissingDependencyError(ObsidianDbError):
     """Raised when an optional dependency is required but not installed."""
+
+
+class MonthlyVolumesWarning(UserWarning):
+    """Warned when a forecast segment is written under stored monthly volumes.
+
+    A forecast can start with stored monthly volumes (a saved Spatial
+    Forecasting run writes them). Obsidian starts the phase at the first of
+    them and uses them as they are for the months they cover, so a segment has
+    no effect before they end. ``set_forecast`` never changes them; a segment
+    that starts after them is the ordinary case and does not warn.
+    """
+
+
+class ModelFieldRefWarning(UserWarning):
+    """Warned when a shared econ model is written while one of its fields is
+    read per well.
+
+    A field of an expense, tax, differential or shrink/yield model can take each
+    well's own value from a well attribute column (Obsidian's model editor sets
+    this up, and an ARIES import does). The number written for such a field is
+    only the stored fallback: every well keeps being charged its own value.
+    ``Database.model_field_refs()`` lists them.
+    """

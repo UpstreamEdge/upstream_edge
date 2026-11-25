@@ -372,3 +372,102 @@ def seed_models(path: Path | str) -> None:
             ("insert into ShrinkYieldModel values (?, ?, ?, ?)", ("SY", 0.1, 40.0, 0.0)),
         ],
     )
+
+
+# The tables Obsidian's own bookkeeping lives in, as a current build creates them.
+_BOOKKEEPING_SCHEMA: tuple[str, ...] = (
+    (
+        "CREATE TABLE ChangeLog (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, "
+        "table_name TEXT NOT NULL, prop_id TEXT, detail TEXT, source INTEGER NOT NULL, user TEXT)"
+    ),
+    "CREATE TABLE 'Metadata'([type] TEXT, [value] TEXT)",
+    'CREATE UNIQUE INDEX idx_Metadata on Metadata("type")',
+    (
+        'CREATE TABLE "ForecastVolumes" (prop_id TEXT, model TEXT, start DATE, oil_bbl BLOB, '
+        "gas_mscf BLOB, water_bbl BLOB, source TEXT, run_id TEXT, created_at TEXT)"
+    ),
+    "CREATE UNIQUE INDEX idx_ForecastVolumes ON ForecastVolumes (prop_id, model)",
+    (
+        'CREATE TABLE "DailyPressure" (prop_id TEXT, date DATE, tubing_psi REAL, bhp_psi REAL, '
+        "choke_64ths REAL)"
+    ),
+)
+
+
+def create_bookkeeping_schema(path: Path | str) -> None:
+    """Add ChangeLog, Metadata, ForecastVolumes and DailyPressure to a test file."""
+    exec_sql(path, _BOOKKEEPING_SCHEMA)
+
+
+def change_log(path: Path | str) -> list[tuple[str, str | None, str | None, int, str | None]]:
+    """The file's ChangeLog rows in the order written: table, well, detail, source, user."""
+    conn = sqlite3.connect(str(path))
+    try:
+        return conn.execute(
+            "SELECT table_name, prop_id, detail, source, user FROM ChangeLog ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def last_modified(path: Path | str) -> list[str]:
+    """Every Metadata.LastModified value in the file (one, or none)."""
+    conn = sqlite3.connect(str(path))
+    try:
+        rows = conn.execute("SELECT value FROM Metadata WHERE type = 'LastModified'").fetchall()
+        return [str(row[0]) for row in rows]
+    finally:
+        conn.close()
+
+
+# Obsidian's own DDL for the tables below, copied from a current file's
+# sqlite_master.
+_SETTINGS_SCHEMA: tuple[str, ...] = (
+    (
+        'CREATE TABLE "RunSettings" (settings_name TEXT, effective_date DATE, '
+        "cutoff_method TEXT, abandon_timing TEXT, afit_enabled BOOLEAN, "
+        "fed_corp_tax_rate REAL, tangible_recovery_period_yrs INTEGER, idc_method TEXT, "
+        "capex_tangible_percents TEXT)"
+    ),
+    "CREATE UNIQUE INDEX idx_RunSettings ON RunSettings (settings_name)",
+    (
+        'CREATE TABLE "TypeCurve" (name TEXT, phase TEXT, normalization TEXT, start_rate REAL, '
+        "build_up_months INTEGER, initial_rate REAL, bridge_months INTEGER, "
+        "bridge_decline REAL, initial_decline REAL, b_factor REAL, minimum_decline REAL, "
+        "ref_apis TEXT, fit_basis TEXT, saved_by TEXT, saved_at INTEGER)"
+    ),
+    "CREATE UNIQUE INDEX idx_TypeCurve ON TypeCurve (name, phase)",
+)
+
+_FIELD_REFS_SCHEMA: tuple[str, ...] = (
+    (
+        'CREATE TABLE "EconModelFieldRefs" (model_type TEXT, model_name TEXT, '
+        "segment_key TEXT, field_name TEXT, attr_column TEXT)"
+    ),
+    (
+        "CREATE UNIQUE INDEX idx_EconModelFieldRefs ON EconModelFieldRefs "
+        "(model_type, model_name, segment_key, field_name)"
+    ),
+)
+
+
+def create_settings_schema(path: Path | str) -> None:
+    """Add RunSettings and TypeCurve, as a current Obsidian creates them."""
+    exec_sql(path, _SETTINGS_SCHEMA)
+
+
+def create_field_refs_schema(path: Path | str) -> None:
+    """Add EconModelFieldRefs, as a current Obsidian creates it."""
+    exec_sql(path, _FIELD_REFS_SCHEMA)
+
+
+def field_refs(path: Path | str) -> list[tuple[str, str, str, str, str]]:
+    """The file's EconModelFieldRefs rows: type, model, segment key, field, column."""
+    conn = sqlite3.connect(str(path))
+    try:
+        return conn.execute(
+            "SELECT model_type, model_name, segment_key, field_name, attr_column "
+            "FROM EconModelFieldRefs ORDER BY 1, 2, 3, 4"
+        ).fetchall()
+    finally:
+        conn.close()

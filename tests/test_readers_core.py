@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import date
 
 import pytest
@@ -71,8 +72,30 @@ def test_wells_treats_empty_strings_as_missing(tmp_path):
             MAIN_SCHEMA,
             (
                 "insert into Main values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("P1", "", "PDP", "MITCHELL", "1H", "", "", "", "", "", "", "",
-                 "", "", "", "", "", "", "", "", "", ""),
+                (
+                    "P1",
+                    "",
+                    "PDP",
+                    "MITCHELL",
+                    "1H",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                ),
             ),
         ],
     )
@@ -181,26 +204,106 @@ def test_production_monthly_reads_native_yyyymm_dates(tmp_path):
             db.production_monthly("P1")
 
 
-def test_reader_rejects_unknown_enum(tmp_path):
-    db_path = tmp_path / "bad.obsdb"
+# Obsidian's own table of spellings (its `rsvcat.rs` tests), each also with a
+# leading ARIES sort digit, plus the whole-text ones and the fallback.
+_RSV_CAT_SPELLINGS = [
+    ("PDP", RsvCat.PDP),
+    ("PDNP", RsvCat.PDNP),
+    ("DNP", RsvCat.PDNP),
+    ("PNP", RsvCat.PDNP),
+    ("PDBP", RsvCat.PDNP),
+    ("COMP", RsvCat.DUC),
+    ("DUC", RsvCat.DUC),
+    ("PERM", RsvCat.PUD),
+    ("PPERM", RsvCat.PROB),
+    ("UND", RsvCat.LOC),
+    ("SI", RsvCat.SHUT_IN),
+    ("PUD", RsvCat.PUD),
+    ("PROB", RsvCat.PROB),
+    ("POSS", RsvCat.POSS),
+    ("LOC", RsvCat.LOC),
+    ("TA", RsvCat.TA),
+    ("SWD", RsvCat.SWD),
+    ("DATA", RsvCat.DATA),
+    ("PVPD", RsvCat.PDP),
+    ("PA", RsvCat.PA),
+]
+
+
+@pytest.mark.parametrize(
+    ("stored", "rsv_cat"),
+    [
+        *_RSV_CAT_SPELLINGS,
+        *[(f"{digit}{text}", rsv_cat) for digit, (text, rsv_cat) in enumerate(_RSV_CAT_SPELLINGS)],
+        ("pdp", RsvCat.PDP),
+        ("  ShutIn ", RsvCat.SHUT_IN),
+        ("PDP_SI", RsvCat.SHUT_IN),
+        ("PDNP_SI", RsvCat.SHUT_IN),
+        ("NP", RsvCat.SHUT_IN),
+        ("Inactive", RsvCat.SHUT_IN),
+        ("Producing", RsvCat.PDP),
+        ("Active Producer", RsvCat.PDP),
+        ("Proved Developed Non-Producing", RsvCat.PDNP),
+        ("BP-PROV", RsvCat.PDNP),
+        ("Drilling", RsvCat.DUC),
+        ("Completed - Not Active", RsvCat.DUC),
+        ("Completed", RsvCat.PDP),
+        ("Permitted", RsvCat.PUD),
+        ("Expired Permit", RsvCat.LOC),
+        ("T/A", RsvCat.TA),
+        ("P & A", RsvCat.PA),
+        ("P&A", RsvCat.PA),
+        ("Plugged", RsvCat.PA),
+        ("Abandoned", RsvCat.PA),
+        ("WIP", RsvCat.PUD),
+        ("Salt Water Disposal", RsvCat.SWD),
+        ("Data", RsvCat.DATA),
+        ("Blank", RsvCat.UNSPECIFIED),
+        ("BAD", RsvCat.UNSPECIFIED),
+        ("", RsvCat.UNSPECIFIED),
+        (None, RsvCat.UNSPECIFIED),
+        (7, RsvCat.UNSPECIFIED),
+    ],
+)
+def test_a_reserve_category_reads_as_obsidian_reads_it(tmp_path, stored, rsv_cat):
+    """Obsidian reads any text in Main.rsv_cat; so does the library, and one
+    odd spelling never fails `wells()` for the whole table."""
+    db_path = tmp_path / "spellings.obsdb"
     exec_sql(
         db_path,
         [
             MAIN_SCHEMA,
-            ("insert into Main (prop_id, rsv_cat) values (?, ?)", ("P1", "BAD")),
+            ("insert into Main (prop_id, rsv_cat) values (?, ?)", ("P1", stored)),
+            ("insert into Main (prop_id, rsv_cat) values (?, ?)", ("P2", "PDP")),
         ],
     )
 
     with Database.open(db_path) as db:
-        with pytest.raises(DataIntegrityError, match="rsv_cat"):
-            db.wells()
+        first, second = db.wells()
+        assert first.rsv_cat is rsv_cat
+        assert second.rsv_cat is RsvCat.PDP
+        well = db.well("P1")
+        assert well is not None and well.rsv_cat is rsv_cat
+
+
+def test_reading_an_odd_reserve_category_does_not_rewrite_it(tmp_path):
+    db_path = tmp_path / "kept.obsdb"
+    exec_sql(
+        db_path,
+        [MAIN_SCHEMA, ("insert into Main (prop_id, rsv_cat) values (?, ?)", ("P1", "1PDP_SI"))],
+    )
+    with Database.open(db_path, change_log=False) as db:
+        assert db.wells()[0].rsv_cat is RsvCat.SHUT_IN
+        db.set_well_header("P1", lease="SMITH")
+    conn = sqlite3.connect(db_path)
+    assert conn.execute("select rsv_cat, lease from Main").fetchall() == [("1PDP_SI", "SMITH")]
+    conn.close()
 
 
 def test_reader_accepts_every_rsv_cat_value(tmp_path):
-    # Every category Obsidian can write to Main.rsv_cat must read back. A value
-    # missing from the enum is not a soft failure here: the reader raises
-    # DataIntegrityError and the whole wells() call fails, so one unlisted
-    # category makes the database unreadable (PDNP did exactly that).
+    # Every category Obsidian can write to Main.rsv_cat must read back as
+    # itself. A spelling missing from the enum would read as a neighbor or as
+    # unspecified (before 1.3 it failed the whole wells() call; PDNP did).
     db_path = tmp_path / "all_cats.obsdb"
     exec_sql(
         db_path,
@@ -234,7 +337,9 @@ def test_reservoir_and_perf_readers_allow_null_depths(tmp_path):
                 "create table Reservoir (prop_id text, reservoir text, top_depth_ft real, "
                 "gross_thickness_ft real)"
             ),
-            ("create table Perfs (prop_id text, perf_start_md_ft real, perf_end_md_ft real, producing integer)"),
+            (
+                "create table Perfs (prop_id text, perf_start_md_ft real, perf_end_md_ft real, producing integer)"
+            ),
             ("insert into Reservoir values (?, ?, ?, ?)", ("P1", "COTTON VALLEY", None, None)),
             ("insert into Perfs values (?, ?, ?, ?)", ("P1", None, None, None)),
         ],

@@ -5,16 +5,41 @@ from __future__ import annotations
 import logging
 import math
 import sqlite3
+import struct
 import warnings
 from collections.abc import Mapping, Sequence
 from datetime import date
 from enum import StrEnum
 
-from ._sql import quote_identifier
+from . import _field_refs
+from ._changelog import (
+    CAPEX,
+    DIFF_MODEL,
+    EXPENSE_MODEL,
+    FORECAST,
+    INTEREST,
+    MAIN,
+    PRICE_MODEL,
+    RUN_SETTINGS,
+    SHRINK_YIELD_MODEL,
+    TAX_MODEL,
+    WELL_MODELS,
+    Change,
+    table_change,
+    well_change,
+)
+from ._sql import (
+    parse_date,
+    quote_identifier,
+    stored_monthly_volumes,
+    tax_ad_valorem_column,
+)
 from ._validation import (
     reject_reserved_name,
+    require_number,
     validate_api10,
     validate_month,
+    validate_new_prop_id,
     validate_percent_0_100,
     validate_percentage,
 )
@@ -23,11 +48,20 @@ from .enums import (
     CapexJobType,
     DiffType,
     ExpenseModelKind,
+    ModelKind,
     Phase,
     RsvCat,
     TaxModelKind,
 )
-from .exceptions import DuplicateError, ModelNotFoundError, ValidationError, WellNotFoundError
+from .exceptions import (
+    DataIntegrityError,
+    DuplicateError,
+    ModelFieldRefWarning,
+    ModelNotFoundError,
+    MonthlyVolumesWarning,
+    ValidationError,
+    WellNotFoundError,
+)
 from .models import (
     CapexItem,
     DailyRow,
@@ -84,7 +118,7 @@ _SYNTHETIC_MODEL_SPECS: tuple[tuple[str, str, str, str], ...] = (
 )
 
 # The per-well tables, besides Main, that `delete_well` clears and `copy_well`
-# copies. Tables newer Obsidian versions key by PropID are not among them.
+# copies. One a file does not have is skipped.
 _WELL_TABLES: tuple[str, ...] = (
     "Monthly",
     "Daily",
@@ -100,6 +134,8 @@ _WELL_TABLES: tuple[str, ...] = (
     "Perfs",
     "PredictorAssignment",
     "WellAttributes",
+    "DailyPressure",
+    "ForecastVolumes",
 )
 
 HEADER_FIELD_TO_SQL: dict[str, str] = {
@@ -115,15 +151,25 @@ HEADER_FIELD_TO_SQL: dict[str, str] = {
     "tvd_ft": "tvd",
     "md_ft": "md",
     "lateral_length_ft": "lateral_length",
-    "spud": "spud",
-    "completion": "completion",
-    "first_prod": "first_prod",
+    "spud_date": "spud",
+    "completion_date": "completion",
+    "first_production_date": "first_prod",
     "state": "state",
     "county": "county",
     "surface_latitude": "surface_latitude",
     "surface_longitude": "surface_longitude",
-    "bh_latitude": "bh_latitude",
-    "bh_longitude": "bh_longitude",
+    "bottom_hole_latitude": "bh_latitude",
+    "bottom_hole_longitude": "bh_longitude",
+}
+
+# The names five header fields had before 1.3 (the database's own column
+# names). Still taken wherever header fields are given by keyword.
+HEADER_FIELD_EARLIER_NAMES: dict[str, str] = {
+    "spud": "spud_date",
+    "completion": "completion_date",
+    "first_prod": "first_production_date",
+    "bh_latitude": "bottom_hole_latitude",
+    "bh_longitude": "bottom_hole_longitude",
 }
 
 
@@ -134,7 +180,7 @@ def add_well(
     rsv_cat: RsvCat,
     api_10: str | None = None,
     header_fields: Mapping[str, object],
-) -> None:
+) -> list[Change]:
     """Insert a Main row for a new well.
 
     Every model assignment starts as ``MAIN``, the same default Obsidian gives a
@@ -143,10 +189,11 @@ def add_well(
     written here rather than left for the caller.
     """
     _require_enum(rsv_cat, RsvCat, method="add_well", param="rsv_cat")
+    validate_new_prop_id(prop_id, field="prop_id", method="add_well")
     validate_api10(api_10, method="add_well")
     if _exists(conn, "Main", "prop_id", prop_id):
         raise DuplicateError(f"add_well(prop_id={prop_id!r}): PropID already exists")
-    fields = dict(header_fields)
+    fields = _header_fields(header_fields, method="add_well")
     fields["api_10"] = api_10
     fields["rsv_cat"] = rsv_cat
     values = _main_values(prop_id, fields, method="add_well")
@@ -180,7 +227,14 @@ def add_well(
     # such rows when it loads the file; drop it here so the new well starts
     # from defaults instead of inheriting the old well's values.
     conn.execute("DELETE FROM WellAttributes WHERE prop_id = ?", (prop_id,))
+    # The same for the two tables `delete_well` left behind before 1.3: a well
+    # deleted then must not hand its stored forecast months to a new well of
+    # the same id.
+    for table in ("ForecastVolumes", "DailyPressure"):
+        if _table_exists(conn, table):
+            conn.execute(f"DELETE FROM {table} WHERE prop_id = ?", (prop_id,))
     _insert_default_attributes(conn, prop_id)
+    return _well_changes(conn, prop_id)
 
 
 def delete_well(conn: sqlite3.Connection, prop_id: str, *, confirm: bool) -> None:
@@ -189,8 +243,10 @@ def delete_well(conn: sqlite3.Connection, prop_id: str, *, confirm: bool) -> Non
 
     The per-well tables are Monthly, Daily, Forecast, WellModels, Interest,
     Capex, Abandonment, Survey, Reservoir, Completion, Casing, Perfs,
-    PredictorAssignment and WellAttributes. One the file does not have (it was
-    last saved by an older Obsidian) holds no rows for the well and is skipped.
+    PredictorAssignment, WellAttributes, ForecastVolumes (a well's stored
+    monthly forecast volumes) and the other tables Obsidian keys by well. One the file
+    does not have (it was last saved by an older Obsidian) holds no rows for
+    the well and is skipped.
     """
     if not confirm:
         raise ValidationError("delete_well: confirm=True is required")
@@ -202,7 +258,7 @@ def delete_well(conn: sqlite3.Connection, prop_id: str, *, confirm: bool) -> Non
     conn.execute("DELETE FROM Main WHERE prop_id = ?", (prop_id,))
 
 
-def copy_well(conn: sqlite3.Connection, from_prop_id: str, to_prop_id: str) -> None:
+def copy_well(conn: sqlite3.Connection, from_prop_id: str, to_prop_id: str) -> list[Change]:
     """Copy a well: its Main row, its rows in the per-well tables, and its
     individual econ models, all under the new PropID.
 
@@ -210,6 +266,7 @@ def copy_well(conn: sqlite3.Connection, from_prop_id: str, to_prop_id: str) -> N
     have is skipped.
     """
     _require_well(conn, from_prop_id, method="copy_well")
+    validate_new_prop_id(to_prop_id, field="to_prop_id", method="copy_well")
     if _exists(conn, "Main", "prop_id", to_prop_id):
         raise DuplicateError(f"copy_well(to_prop_id={to_prop_id!r}): PropID already exists")
     _copy_prop_id_rows(conn, "Main", from_prop_id, to_prop_id)
@@ -217,14 +274,18 @@ def copy_well(conn: sqlite3.Connection, from_prop_id: str, to_prop_id: str) -> N
         if _table_exists(conn, table):
             _copy_prop_id_rows(conn, table, from_prop_id, to_prop_id)
     _copy_synthetic_models_for_well(conn, from_prop_id, to_prop_id)
+    return _well_changes(conn, to_prop_id)
 
 
-def set_well_header(conn: sqlite3.Connection, prop_id: str, fields: Mapping[str, object]) -> None:
+def set_well_header(
+    conn: sqlite3.Connection, prop_id: str, fields: Mapping[str, object]
+) -> list[Change]:
     """Update selected Main columns for an existing well."""
     if not fields:
         raise ValidationError("set_well_header: at least one field must be specified")
     if not _exists(conn, "Main", "prop_id", prop_id):
         raise WellNotFoundError(prop_id, f"set_well_header(prop_id={prop_id!r}): well not found")
+    fields = _header_fields(fields, method="set_well_header")
     assignments: list[str] = []
     values: list[object] = []
     for field, value in fields.items():
@@ -244,8 +305,17 @@ def set_well_header(conn: sqlite3.Connection, prop_id: str, fields: Mapping[str,
             )
         assignments.append(f"{quote_identifier(HEADER_FIELD_TO_SQL[field])} = ?")
         values.append(_db_value(value))
+    columns = [HEADER_FIELD_TO_SQL[field] for field in fields]
+    selected = ", ".join(quote_identifier(column) for column in columns)
+    before = conn.execute(f"SELECT {selected} FROM Main WHERE prop_id = ?", (prop_id,)).fetchone()
+    changed = [
+        column
+        for column, value in zip(columns, values, strict=True)
+        if _blank_as_none(before[column]) != _blank_as_none(value)
+    ]
     values.append(prop_id)
     conn.execute(f"UPDATE Main SET {', '.join(assignments)} WHERE prop_id = ?", tuple(values))
+    return [well_change(MAIN, prop_id, column) for column in changed]
 
 
 def set_monthly_prod(conn: sqlite3.Connection, rows: list[MonthlyRow]) -> None:
@@ -284,7 +354,12 @@ def set_monthly_prod(conn: sqlite3.Connection, rows: list[MonthlyRow]) -> None:
                 first_prod = COALESCE(first_prod, ?)
             WHERE prop_id = ?
             """,
-            (earliest.isoformat(), earliest.isoformat(), earliest.isoformat(), prop_id),
+            (
+                _as_date(earliest).isoformat(),
+                _as_date(earliest).isoformat(),
+                _as_date(earliest).isoformat(),
+                prop_id,
+            ),
         )
 
 
@@ -303,7 +378,13 @@ def set_daily_prod(conn: sqlite3.Connection, rows: list[DailyRow]) -> None:
                 gas_mcfd = excluded.gas_mcfd,
                 water_bwpd = excluded.water_bwpd
             """,
-            (row.prop_id, row.date.isoformat(), row.oil_bopd, row.gas_mcfd, row.water_bwpd),
+            (
+                row.prop_id,
+                _as_date(row.date).isoformat(),
+                row.oil_bopd,
+                row.gas_mcfd,
+                row.water_bwpd,
+            ),
         )
 
 
@@ -339,11 +420,13 @@ def set_forecast(
     model: str,
     phase: Phase,
     segments: list[ForecastSegment],
-) -> None:
+) -> list[Change]:
     """Replace forecast segments for one PropID/model/phase.
 
     ``model`` is a forecast-model name. The curve is not applied until a
     scenario references the name through ``set_scenario(forecast_model=...)``.
+    Stored monthly volumes the phase starts with are left as they are, with a
+    warning: they take precedence over a segment for the months they cover.
     """
     _require_enum(phase, Phase, method="set_forecast", param="phase")
     _require_well(conn, prop_id, method="set_forecast")
@@ -354,8 +437,26 @@ def set_forecast(
     starts = [segment.start for segment in segments]
     if len(starts) != len(set(starts)):
         raise ValidationError("set_forecast: duplicate segment start dates are not allowed")
+    for segment in segments:
+        _require_segment_numbers(segment)
+    stored = _stored_volumes(conn, " WHERE prop_id = ? AND model = ?", [prop_id, model], phase)
+    if stored:
+        _, _, first, months = stored[0]
+        after = _months_after(first, months)
+        # A tail that starts where the stored months end is the ordinary case
+        # and needs no word. A segment that starts earlier does.
+        if any(_as_date(segment.start) < after for segment in segments):
+            warnings.warn(
+                f"set_forecast(prop_id={prop_id!r}, model={model!r}): this forecast starts "
+                f"with {months} stored monthly volumes, {first:%Y-%m} up to {after:%Y-%m}. "
+                "Obsidian starts the phase at the first of them and uses them as they are, "
+                f"so a segment has no effect before {after:%Y-%m}. They are not changed; "
+                "forecasts() returns them.",
+                MonthlyVolumesWarning,
+                stacklevel=3,
+            )
     conn.execute(
-        "DELETE FROM Forecast WHERE prop_id = ? AND model = ? AND phase = ?",
+        "DELETE FROM Forecast WHERE prop_id = ? AND model = ? AND upper(phase) = ?",
         (prop_id, model, phase.value),
     )
     for segment in sorted(segments, key=lambda item: item.start):
@@ -370,7 +471,7 @@ def set_forecast(
                 prop_id,
                 model,
                 phase.value,
-                segment.start.isoformat(),
+                _as_date(segment.start).isoformat(),
                 segment.type_curve,
                 segment.rate_init,
                 segment.decline_init,
@@ -378,6 +479,7 @@ def set_forecast(
                 segment.decline_min,
             ),
         )
+    return [well_change(FORECAST, prop_id, model)]
 
 
 def delete_forecast(
@@ -387,8 +489,14 @@ def delete_forecast(
     phase: Phase | None = None,
     *,
     confirm: bool = False,
-) -> None:
-    """Delete forecast rows matching optional filters."""
+) -> list[Change]:
+    """Delete forecast rows matching optional filters.
+
+    A forecast is its segments and any stored monthly volumes it starts with;
+    both go. With a ``phase``, that phase's segments go and its stored months
+    are cleared, the other phases' kept, which is what deleting one phase in
+    Obsidian does.
+    """
     if not confirm:
         raise ValidationError("delete_forecast: confirm=True is required")
     if phase is not None:
@@ -402,14 +510,29 @@ def delete_forecast(
     if model is not None:
         clauses.append("model = ?")
         params.append(model)
+    forecast_where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     if phase is not None:
-        clauses.append("phase = ?")
-        params.append(phase.value)
-    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-    conn.execute(f"DELETE FROM Forecast{where}", tuple(params))
+        changes = _clear_stored_phase(conn, forecast_where, params, phase)
+        where = f" WHERE {' AND '.join([*clauses, 'upper(phase) = ?'])}"
+        changes += _keyed_changes(
+            conn, FORECAST, "Forecast", "model", where, [*params, phase.value]
+        )
+        conn.execute(f"DELETE FROM Forecast{where}", (*params, phase.value))
+        return changes
+    changes = _keyed_changes(conn, FORECAST, "Forecast", "model", forecast_where, params)
+    if _table_exists(conn, "ForecastVolumes"):
+        # A forecast with both parts is named twice; the log keeps one row per key.
+        changes += _keyed_changes(
+            conn, FORECAST, "ForecastVolumes", "model", forecast_where, params
+        )
+        conn.execute(f"DELETE FROM ForecastVolumes{forecast_where}", tuple(params))
+    conn.execute(f"DELETE FROM Forecast{forecast_where}", tuple(params))
+    return changes
 
 
-def set_price_model(conn: sqlite3.Connection, name: str, segments: list[PriceModelSegment]) -> None:
+def set_price_model(
+    conn: sqlite3.Connection, name: str, segments: list[PriceModelSegment]
+) -> list[Change]:
     """Replace a price model with one or more segments.
 
     Stores a named, shared deck only. It is applied to a scenario's wells
@@ -423,22 +546,26 @@ def set_price_model(conn: sqlite3.Connection, name: str, segments: list[PriceMod
     for segment in sorted(segments, key=lambda item: item.start_date):
         conn.execute(
             "INSERT INTO PriceModel (price_model_name, start_date, oil, gas, ngl) VALUES (?, ?, ?, ?, ?)",
-            (name, segment.start_date.isoformat(), segment.oil, segment.gas, segment.ngl),
+            (name, _as_date(segment.start_date).isoformat(), segment.oil, segment.gas, segment.ngl),
         )
+    return [table_change(PRICE_MODEL, name)]
 
 
-def delete_price_model(conn: sqlite3.Connection, name: str, *, confirm: bool = False) -> None:
+def delete_price_model(
+    conn: sqlite3.Connection, name: str, *, confirm: bool = False
+) -> list[Change]:
     """Delete all segments for a price model."""
     if not confirm:
         raise ValidationError("delete_price_model: confirm=True is required")
-    conn.execute("DELETE FROM PriceModel WHERE price_model_name = ?", (name,))
+    deleted = conn.execute("DELETE FROM PriceModel WHERE price_model_name = ?", (name,)).rowcount
+    return [table_change(PRICE_MODEL, name)] if deleted else []
 
 
 def set_expense_model(
     conn: sqlite3.Connection,
     name: str,
     segments: list[ExpenseModelSegment],
-) -> None:
+) -> list[Change]:
     """Replace a shared expense model."""
     reject_reserved_name(name, field="name", method="set_expense_model")
     _require_segments(segments, method="set_expense_model", delete_method="delete_expense_model")
@@ -446,6 +573,13 @@ def set_expense_model(
         _expense_model_type(segment, method="set_expense_model") for segment in segments
     ]
     _require_unique_text(segment_keys, method="set_expense_model", label="model_type")
+    _field_refs.carry(
+        conn,
+        ModelKind.EXPENSE,
+        name,
+        [_segment_start(segment.age_months, segment.effective_date) for segment in segments],
+        method="set_expense_model",
+    )
     conn.execute("DELETE FROM ExpenseModel WHERE exp_model_name = ?", (name,))
     for segment, segment_key in sorted(
         zip(segments, segment_keys, strict=True), key=lambda item: item[1]
@@ -465,20 +599,26 @@ def set_expense_model(
                 segment.variable_water,
             ),
         )
+    _warn_if_read_per_well(conn, ModelKind.EXPENSE, name, method="set_expense_model")
+    return [table_change(EXPENSE_MODEL, name)]
 
 
-def delete_expense_model(conn: sqlite3.Connection, name: str, *, confirm: bool = False) -> None:
+def delete_expense_model(
+    conn: sqlite3.Connection, name: str, *, confirm: bool = False
+) -> list[Change]:
     """Delete a shared expense model."""
     if not confirm:
         raise ValidationError("delete_expense_model: confirm=True is required")
-    conn.execute("DELETE FROM ExpenseModel WHERE exp_model_name = ?", (name,))
+    deleted = conn.execute("DELETE FROM ExpenseModel WHERE exp_model_name = ?", (name,)).rowcount
+    _field_refs.delete_for_model(conn, ModelKind.EXPENSE, name)
+    return [table_change(EXPENSE_MODEL, name)] if deleted else []
 
 
 def set_tax_model(
     conn: sqlite3.Connection,
     name: str,
     segments: list[TaxModelSegment],
-) -> None:
+) -> list[Change]:
     """Replace a shared tax model."""
     reject_reserved_name(name, field="name", method="set_tax_model")
     _require_segments(segments, method="set_tax_model", delete_method="delete_tax_model")
@@ -488,15 +628,25 @@ def set_tax_model(
         validate_percentage(segment.sev_tax_oil, field="sev_tax_oil", method="set_tax_model")
         validate_percentage(segment.sev_tax_gas, field="sev_tax_gas", method="set_tax_model")
         validate_percentage(segment.sev_tax_ngl, field="sev_tax_ngl", method="set_tax_model")
-        validate_percentage(segment.ad_valorum_tax, field="ad_valorum_tax", method="set_tax_model")
+        validate_percentage(segment.ad_valorem_tax, field="ad_valorem_tax", method="set_tax_model")
+    _field_refs.carry(
+        conn,
+        ModelKind.TAX,
+        name,
+        [_segment_start(segment.age_months, segment.effective_date) for segment in segments],
+        method="set_tax_model",
+    )
+    # The file's own spelling of the ad valorem column; never renamed here.
+    ad_valorem_column = tax_ad_valorem_column(conn)
     conn.execute("DELETE FROM TaxModel WHERE tax_model_name = ?", (name,))
     for segment, segment_key in sorted(
         zip(segments, segment_keys, strict=True), key=lambda item: item[1]
     ):
         conn.execute(
-            """
+            f"""
             INSERT INTO TaxModel (
-                tax_model_name, model_type, sev_tax_oil, sev_tax_gas, sev_tax_ngl, ad_valorum_tax
+                tax_model_name, model_type, sev_tax_oil, sev_tax_gas, sev_tax_ngl,
+                {ad_valorem_column}
             ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
@@ -505,23 +655,27 @@ def set_tax_model(
                 segment.sev_tax_oil,
                 segment.sev_tax_gas,
                 segment.sev_tax_ngl,
-                segment.ad_valorum_tax,
+                segment.ad_valorem_tax,
             ),
         )
+    _warn_if_read_per_well(conn, ModelKind.TAX, name, method="set_tax_model")
+    return [table_change(TAX_MODEL, name)]
 
 
-def delete_tax_model(conn: sqlite3.Connection, name: str, *, confirm: bool = False) -> None:
+def delete_tax_model(conn: sqlite3.Connection, name: str, *, confirm: bool = False) -> list[Change]:
     """Delete a shared tax model."""
     if not confirm:
         raise ValidationError("delete_tax_model: confirm=True is required")
-    conn.execute("DELETE FROM TaxModel WHERE tax_model_name = ?", (name,))
+    deleted = conn.execute("DELETE FROM TaxModel WHERE tax_model_name = ?", (name,)).rowcount
+    _field_refs.delete_for_model(conn, ModelKind.TAX, name)
+    return [table_change(TAX_MODEL, name)] if deleted else []
 
 
 def set_diff_model(
     conn: sqlite3.Connection,
     name: str,
     segments: list[DiffModelSegment],
-) -> None:
+) -> list[Change]:
     """Replace a shared differential model.
 
     Obsidian's DiffModel also carries a condensate differential, which this
@@ -546,12 +700,19 @@ def set_diff_model(
             (name,),
         ).fetchall()
     }
+    _field_refs.carry(
+        conn,
+        ModelKind.DIFF,
+        name,
+        [_field_refs.month_start(segment.start_date) for segment in segments],
+        method="set_diff_model",
+    )
     conn.execute("DELETE FROM DiffModel WHERE diff_model_name = ?", (name,))
     for segment in sorted(segments, key=lambda item: item.start_date):
         # A segment on a start_date the model did not have before gets the same
         # defaults Obsidian's own schema applies to a new row.
         condensate_method, condensate_diff = existing_condensate.get(
-            segment.start_date.isoformat(), (DiffType.FRACTION.value, 0.0)
+            _as_date(segment.start_date).isoformat(), (DiffType.FRACTION.value, 0.0)
         )
         conn.execute(
             """
@@ -562,7 +723,7 @@ def set_diff_model(
             """,
             (
                 name,
-                segment.start_date.isoformat(),
+                _as_date(segment.start_date).isoformat(),
                 segment.oil_method.value,
                 segment.oil_diff,
                 segment.gas_method.value,
@@ -573,13 +734,19 @@ def set_diff_model(
                 condensate_diff,
             ),
         )
+    _warn_if_read_per_well(conn, ModelKind.DIFF, name, method="set_diff_model")
+    return [table_change(DIFF_MODEL, name)]
 
 
-def delete_diff_model(conn: sqlite3.Connection, name: str, *, confirm: bool = False) -> None:
+def delete_diff_model(
+    conn: sqlite3.Connection, name: str, *, confirm: bool = False
+) -> list[Change]:
     """Delete a shared differential model."""
     if not confirm:
         raise ValidationError("delete_diff_model: confirm=True is required")
-    conn.execute("DELETE FROM DiffModel WHERE diff_model_name = ?", (name,))
+    deleted = conn.execute("DELETE FROM DiffModel WHERE diff_model_name = ?", (name,)).rowcount
+    _field_refs.delete_for_model(conn, ModelKind.DIFF, name)
+    return [table_change(DIFF_MODEL, name)] if deleted else []
 
 
 def set_shrink_yield_model(
@@ -588,7 +755,7 @@ def set_shrink_yield_model(
     *,
     gas_shrink_frac: float,
     ngl_yield_bbl_mmscf: float,
-) -> None:
+) -> list[Change]:
     """Replace a shared shrink/yield model.
 
     Obsidian's ShrinkYieldModel also carries a condensate yield, which this
@@ -613,13 +780,21 @@ def set_shrink_yield_model(
         """,
         (name, gas_shrink_frac, ngl_yield_bbl_mmscf, condensate_yield),
     )
+    _warn_if_read_per_well(conn, ModelKind.SHRINK_YIELD, name, method="set_shrink_yield_model")
+    return [table_change(SHRINK_YIELD_MODEL, name)]
 
 
-def delete_shrink_yield_model(conn: sqlite3.Connection, name: str, *, confirm: bool = False) -> None:
+def delete_shrink_yield_model(
+    conn: sqlite3.Connection, name: str, *, confirm: bool = False
+) -> list[Change]:
     """Delete a shared shrink/yield model."""
     if not confirm:
         raise ValidationError("delete_shrink_yield_model: confirm=True is required")
-    conn.execute("DELETE FROM ShrinkYieldModel WHERE shrink_yield_model_name = ?", (name,))
+    deleted = conn.execute(
+        "DELETE FROM ShrinkYieldModel WHERE shrink_yield_model_name = ?", (name,)
+    ).rowcount
+    _field_refs.delete_for_model(conn, ModelKind.SHRINK_YIELD, name)
+    return [table_change(SHRINK_YIELD_MODEL, name)] if deleted else []
 
 
 def create_scenario(conn: sqlite3.Connection, name: str, *, copy_from: str | None = None) -> None:
@@ -644,7 +819,8 @@ def create_scenario(conn: sqlite3.Connection, name: str, *, copy_from: str | Non
     ]
     selected = ", ".join(quote_identifier(column) for column in source_columns)
     source = conn.execute(
-        f"SELECT {selected} FROM Scenario WHERE scenario = ?" if selected
+        f"SELECT {selected} FROM Scenario WHERE scenario = ?"
+        if selected
         else "SELECT scenario FROM Scenario WHERE scenario = ?",
         (copy_from,),
     ).fetchone()
@@ -654,9 +830,7 @@ def create_scenario(conn: sqlite3.Connection, name: str, *, copy_from: str | Non
             copy_from,
             f"create_scenario(copy_from={copy_from!r}): source scenario does not exist",
         )
-    insert_columns = ", ".join(
-        quote_identifier(column) for column in ("scenario", *source_columns)
-    )
+    insert_columns = ", ".join(quote_identifier(column) for column in ("scenario", *source_columns))
     placeholders = ", ".join("?" * (len(source_columns) + 1))
     conn.execute(
         f"INSERT INTO Scenario ({insert_columns}) VALUES ({placeholders})",
@@ -727,25 +901,61 @@ def set_scenario(
     conn.execute(f"UPDATE Scenario SET {', '.join(assignments)} WHERE scenario = ?", tuple(params))
 
 
+def set_run_settings(
+    conn: sqlite3.Connection, name: str, *, effective_date: date | None = None
+) -> list[Change]:
+    """Update a run settings' effective date.
+
+    The date is the first day of the month the economics run from. The change
+    is logged only when the date moves, as Obsidian logs it.
+    """
+    if effective_date is None:
+        raise ValidationError("set_run_settings: at least one field must be specified")
+    validate_month(effective_date, field="effective_date", method="set_run_settings")
+    row = conn.execute(
+        "SELECT effective_date FROM RunSettings WHERE settings_name = ?", (name,)
+    ).fetchone()
+    if row is None:
+        raise ModelNotFoundError(
+            "RunSettings", name, f"set_run_settings(name={name!r}): run settings not found"
+        )
+    stored = _as_date(effective_date).isoformat()
+    if str(row[0] or "")[:10] == stored:
+        return []
+    conn.execute(
+        "UPDATE RunSettings SET effective_date = ? WHERE settings_name = ?", (stored, name)
+    )
+    return [table_change(RUN_SETTINGS, name)]
+
+
 def set_well_models(
     conn: sqlite3.Connection,
     prop_ids: str | list[str],
     scenario: str,
     *,
-    exp_model: str | None = None,
+    expense_model: str | None = None,
     capex_model: str | None = None,
     diff_model: str | None = None,
     tax_model: str | None = None,
     shrink_yield_model: str | None = None,
     interest_model: str | None = None,
-) -> None:
+    exp_model: str | None = None,
+) -> list[Change]:
     """Partially update per-well model assignments for a scenario.
 
     Handles the six per-well model kinds only. The scenario-global forecast and
     price models are assigned through ``set_scenario``, not here.
     """
+    # `exp_model` is the name `expense_model` had before 1.3.
+    if exp_model is not None:
+        if expense_model is not None:
+            raise ValidationError(
+                "set_well_models: the expense model was given twice, as 'expense_model' "
+                "and as 'exp_model'"
+            )
+        expense_model = exp_model
     updates = {
-        "exp_model_name": exp_model,
+        "exp_model_name": expense_model,
         "capex_model_name": capex_model,
         "diff_model_name": diff_model,
         "tax_model_name": tax_model,
@@ -762,9 +972,9 @@ def set_well_models(
     ids = _prop_id_list(prop_ids)
     for prop_id in ids:
         _require_well(conn, prop_id, method="set_well_models")
-    if exp_model is not None:
+    if expense_model is not None:
         _require_model(
-            conn, "Expense", "ExpenseModel", "exp_model_name", exp_model, "set_well_models"
+            conn, "Expense", "ExpenseModel", "exp_model_name", expense_model, "set_well_models"
         )
     if diff_model is not None:
         _require_model(conn, "Diff", "DiffModel", "diff_model_name", diff_model, "set_well_models")
@@ -790,11 +1000,12 @@ def set_well_models(
             f"UPDATE WellModels SET {assignments} WHERE prop_id = ? AND scenario = ?",
             (*updates.values(), prop_id, scenario),
         )
+    return [well_change(WELL_MODELS, prop_id, scenario) for prop_id in ids]
 
 
 def set_interest(
     conn: sqlite3.Connection, prop_ids: str | list[str], model: str, segments: list[InterestSegment]
-) -> None:
+) -> list[Change]:
     """Replace an interest schedule for one model across one or more wells."""
     reject_reserved_name(model, field="model", method="set_interest")
     _require_segments(segments, method="set_interest", delete_method="delete_interest")
@@ -808,6 +1019,7 @@ def set_interest(
         validate_percent_0_100(segment.wi_pct, field="wi_pct", method="set_interest")
         validate_percent_0_100(segment.nri_pct, field="nri_pct", method="set_interest")
     is_new_model = not _exists(conn, "Interest", "model", model)
+    missing: list[str] = []
     if is_new_model:
         all_prop_ids = _all_prop_ids(conn)
         missing = sorted(all_prop_ids - set(ids))
@@ -822,8 +1034,15 @@ def set_interest(
         for segment in sorted(segments, key=lambda item: item.start):
             conn.execute(
                 "INSERT INTO Interest (prop_id, model, start, wi_pct, nri_pct) VALUES (?, ?, ?, ?, ?)",
-                (prop_id, model, segment.start.isoformat(), segment.wi_pct, segment.nri_pct),
+                (
+                    prop_id,
+                    model,
+                    _as_date(segment.start).isoformat(),
+                    segment.wi_pct,
+                    segment.nri_pct,
+                ),
             )
+    return [well_change(INTEREST, prop_id, model) for prop_id in (*ids, *missing)]
 
 
 def delete_interest(
@@ -832,7 +1051,7 @@ def delete_interest(
     model: str | None = None,
     *,
     confirm: bool = False,
-) -> None:
+) -> list[Change]:
     """Delete interest rows matching optional filters."""
     if not confirm:
         raise ValidationError("delete_interest: confirm=True is required")
@@ -847,10 +1066,14 @@ def delete_interest(
         clauses.append("model = ?")
         params.append(model)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    changes = _keyed_changes(conn, INTEREST, "Interest", "model", where, params)
     conn.execute(f"DELETE FROM Interest{where}", tuple(params))
+    return changes
 
 
-def set_capex(conn: sqlite3.Connection, prop_id: str, model: str, items: list[CapexItem]) -> None:
+def set_capex(
+    conn: sqlite3.Connection, prop_id: str, model: str, items: list[CapexItem]
+) -> list[Change]:
     """Replace capex items for one PropID/model pair."""
     reject_reserved_name(model, field="model", method="set_capex")
     _require_well(conn, prop_id, method="set_capex")
@@ -858,6 +1081,7 @@ def set_capex(conn: sqlite3.Connection, prop_id: str, model: str, items: list[Ca
         raise ValidationError("set_capex: items cannot be empty; use delete_capex to clear")
     for item in items:
         _require_enum(item.job_type, CapexJobType, method="set_capex", param="job_type")
+        require_number(item.cost_gross, field="cost_gross", method="set_capex")
     conn.execute("DELETE FROM Capex WHERE prop_id = ? AND model = ?", (prop_id, model))
     for item in sorted(items, key=lambda entry: entry.date):
         conn.execute(
@@ -868,12 +1092,13 @@ def set_capex(conn: sqlite3.Connection, prop_id: str, model: str, items: list[Ca
             (
                 prop_id,
                 model,
-                item.date.isoformat(),
+                _as_date(item.date).isoformat(),
                 item.job_type.value,
                 item.cost_gross,
                 item.description,
             ),
         )
+    return [well_change(CAPEX, prop_id, model)]
 
 
 def delete_capex(
@@ -882,7 +1107,7 @@ def delete_capex(
     model: str | None = None,
     *,
     confirm: bool = False,
-) -> None:
+) -> list[Change]:
     """Delete capex rows matching optional filters."""
     if not confirm:
         raise ValidationError("delete_capex: confirm=True is required")
@@ -896,10 +1121,14 @@ def delete_capex(
         clauses.append("model = ?")
         params.append(model)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    changes = _keyed_changes(conn, CAPEX, "Capex", "model", where, params)
     conn.execute(f"DELETE FROM Capex{where}", tuple(params))
+    return changes
 
 
-def set_abandonment(conn: sqlite3.Connection, prop_id: str, model: str, cost_gross: float) -> None:
+def set_abandonment(
+    conn: sqlite3.Connection, prop_id: str, model: str, cost_gross: float
+) -> list[Change]:
     """Replace one abandonment cost row.
 
     Every well carries an abandonment cost for each model; pass ``cost_gross=0.0``
@@ -907,11 +1136,13 @@ def set_abandonment(conn: sqlite3.Connection, prop_id: str, model: str, cost_gro
     """
     reject_reserved_name(model, field="model", method="set_abandonment")
     _require_well(conn, prop_id, method="set_abandonment")
+    require_number(cost_gross, field="cost_gross", method="set_abandonment")
     conn.execute("DELETE FROM Abandonment WHERE prop_id = ? AND model = ?", (prop_id, model))
     conn.execute(
         "INSERT INTO Abandonment (prop_id, model, cost_gross) VALUES (?, ?, ?)",
         (prop_id, model, cost_gross),
     )
+    return [well_change(CAPEX, prop_id, model)]
 
 
 def set_surveys(conn: sqlite3.Connection, prop_id: str, points: list[SurveyPointInput]) -> None:
@@ -1143,14 +1374,217 @@ def rename_well_attribute_column(conn: sqlite3.Connection, old: str, new: str) -
     conn.execute(
         f"ALTER TABLE WellAttributes RENAME COLUMN {quote_identifier(old)} TO {quote_identifier(new)}"
     )
+    # An econ model field that reads the column keeps reading it.
+    _field_refs.rename_column(conn, old, new)
 
 
-def delete_well_attribute_column(conn: sqlite3.Connection, name: str, *, confirm: bool) -> None:
-    """Delete a user-defined WellAttributes column."""
+def delete_well_attribute_column(
+    conn: sqlite3.Connection, name: str, *, confirm: bool, detach_model_refs: bool = False
+) -> None:
+    """Delete a user-defined WellAttributes column.
+
+    A column that an econ model field reads per well is not deleted unless
+    ``detach_model_refs`` is set: the references are then removed with it, and
+    those fields go back to the number stored on the model. It is Obsidian's
+    own rule (its "Detach & Delete").
+    """
     if not confirm:
         raise ValidationError("delete_well_attribute_column: confirm=True is required")
     _require_attribute_column(conn, name, method="delete_well_attribute_column")
+    models = _field_refs.models_on_column(conn, name)
+    if models and not detach_model_refs:
+        shown = ", ".join(models[:5]) + (f" (+{len(models) - 5} more)" if len(models) > 5 else "")
+        raise ValidationError(
+            f"delete_well_attribute_column: column {name!r} is read per well by econ model "
+            f"fields on {shown}. Pass detach_model_refs=True to remove those references with "
+            "the column (the models keep their stored numbers); model_field_refs() lists them."
+        )
+    _field_refs.detach_column(conn, name)
     conn.execute(f"ALTER TABLE WellAttributes DROP COLUMN {quote_identifier(name)}")
+
+
+def set_parent_version(conn: sqlite3.Connection, version: str) -> None:
+    """Record the version the database now descends from (``Metadata.Parent``),
+    as Obsidian does when a snapshot lands. A file without the Metadata table
+    is left as it is."""
+    if not _table_exists(conn, "Metadata"):
+        return
+    updated = conn.execute(
+        "UPDATE Metadata SET value = ? WHERE type = 'Parent'", (version,)
+    ).rowcount
+    if updated == 0:
+        conn.execute("INSERT INTO Metadata (type, value) VALUES ('Parent', ?)", (version,))
+
+
+def _well_changes(conn: sqlite3.Connection, prop_id: str) -> list[Change]:
+    """What a new or copied well logs: one change per forecast model it has
+    rows under, segments or stored monthly volumes.
+
+    This is all Obsidian logs for a well it creates or copies. The interests,
+    capital and assignments a well starts with are its defaults, not edits.
+    """
+    models: dict[str, None] = {}
+    for table in ("Forecast", "ForecastVolumes"):
+        if not _table_exists(conn, table):
+            continue
+        rows = conn.execute(
+            f"SELECT DISTINCT model FROM {table} WHERE prop_id = ? ORDER BY 1", (prop_id,)
+        ).fetchall()
+        models.update(dict.fromkeys(str(row[0]) for row in rows))
+    return [well_change(FORECAST, prop_id, model) for model in sorted(models)]
+
+
+def _keyed_changes(
+    conn: sqlite3.Connection,
+    log_table: str,
+    table: str,
+    column: str,
+    where: str,
+    params: Sequence[object],
+) -> list[Change]:
+    """One change per well and model among the rows a delete is about to
+    remove. A filter that matches nothing logs nothing."""
+    rows = conn.execute(
+        f"SELECT DISTINCT prop_id, {column} FROM {table}{where} ORDER BY 1, 2", tuple(params)
+    ).fetchall()
+    return [well_change(log_table, str(row[0]), str(row[1])) for row in rows]
+
+
+def _blank_as_none(value: object) -> object:
+    """Obsidian stores a missing optional value as NULL or as empty text."""
+    return None if value == "" else value
+
+
+_VOLUME_COLUMNS = {Phase.OIL: "oil_bbl", Phase.GAS: "gas_mscf", Phase.WATER: "water_bbl"}
+
+
+def _stored_rows(
+    conn: sqlite3.Connection, where: str, params: Sequence[object]
+) -> list[tuple[str, str, date, dict[Phase, tuple[float, ...]]]]:
+    """The ForecastVolumes rows Obsidian uses among the wells and models asked
+    for: ``(prop_id, model, first month, the months of each phase)``. A row it
+    skips at load (unreadable, or naming no model) is not among them."""
+    if not _table_exists(conn, "ForecastVolumes"):
+        return []
+    rows = conn.execute(
+        "SELECT prop_id, model, start, oil_bbl, gas_mscf, water_bbl "
+        f"FROM ForecastVolumes{where} ORDER BY 1, 2",
+        tuple(params),
+    ).fetchall()
+    used: list[tuple[str, str, date, dict[Phase, tuple[float, ...]]]] = []
+    for row in rows:
+        first = parse_date(row[2])
+        if first is None or not str(row[1] or "").strip():
+            continue
+        try:
+            oil, gas, water = stored_monthly_volumes(row[3], row[4], row[5])
+        except DataIntegrityError:
+            continue
+        series = {Phase.OIL: oil, Phase.GAS: gas, Phase.WATER: water}
+        used.append((str(row[0]), str(row[1]), first.replace(day=1), series))
+    return used
+
+
+def _stored_volumes(
+    conn: sqlite3.Connection, where: str, params: Sequence[object], phase: Phase
+) -> list[tuple[str, str, date, int]]:
+    """The forecasts among the wells and models asked for that start with stored
+    monthly volumes of the phase: ``(prop_id, model, first month, months)``. A
+    phase whose stored months are all zero has none, as Obsidian reads it."""
+    return [
+        (prop_id, model, first, len(series[phase]))
+        for prop_id, model, first, series in _stored_rows(conn, where, params)
+        if any(volume > 0.0 for volume in series[phase])
+    ]
+
+
+def _clear_stored_phase(
+    conn: sqlite3.Connection, where: str, params: Sequence[object], phase: Phase
+) -> list[Change]:
+    """Clear one phase's stored months, as Obsidian's own delete of a phase
+    does: the phase's months become zero, and a row left with no phase at all
+    is removed. Left in place they would go on being the phase's forecast."""
+    changes: list[Change] = []
+    for prop_id, model, _, series in _stored_rows(conn, where, params):
+        if not any(volume > 0.0 for volume in series[phase]):
+            continue
+        key = (prop_id, model)
+        others = [volumes for other, volumes in series.items() if other is not phase]
+        if all(volume <= 0.0 for volumes in others for volume in volumes):
+            conn.execute("DELETE FROM ForecastVolumes WHERE prop_id = ? AND model = ?", key)
+        else:
+            zeros = struct.pack(f"<{len(series[phase])}f", *([0.0] * len(series[phase])))
+            conn.execute(
+                f"UPDATE ForecastVolumes SET {_VOLUME_COLUMNS[phase]} = ? "
+                "WHERE prop_id = ? AND model = ?",
+                (zeros, *key),
+            )
+        changes.append(well_change(FORECAST, prop_id, model))
+    return changes
+
+
+def _months_after(first: date, months: int) -> date:
+    """The first day of the month that follows a run of months."""
+    count = first.year * 12 + (first.month - 1) + months
+    return date(count // 12, count % 12 + 1, 1)
+
+
+def _as_date(value: date) -> date:
+    """A date with no time of day. A ``datetime`` (or a pandas ``Timestamp``)
+    is a date too, and written as it is would store a time Obsidian and this
+    library both refuse to read back."""
+    return date(value.year, value.month, value.day)
+
+
+def _require_segment_numbers(segment: ForecastSegment) -> None:
+    """A segment needs a start date and, unless it follows a type curve, its
+    four decline numbers."""
+    if not isinstance(segment.start, date):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raise ValidationError(
+            f"set_forecast: a segment's start must be a date; got {segment.start!r}"
+        )
+    if segment.type_curve:
+        return
+    for name in ("rate_init", "decline_init", "b_factor", "decline_min"):
+        value = getattr(segment, name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+        ):
+            raise ValidationError(
+                f"set_forecast: the segment starting {segment.start} has {name}={value!r}; a "
+                "decline segment needs a number there. (A row of forecasts() whose kind is "
+                "MONTHLY_VOLUMES is not a segment and cannot be written as one.)"
+            )
+
+
+def _segment_start(age_months: int | None, effective_date: date | None) -> _field_refs.Start:
+    """When an expense or tax segment starts, for matching its field references."""
+    if age_months is not None:
+        return _field_refs.aged_start(age_months)
+    if effective_date is not None:
+        return _field_refs.dated_start(effective_date)
+    return _field_refs.simple_start()
+
+
+def _warn_if_read_per_well(
+    conn: sqlite3.Connection, kind: ModelKind, name: str, *, method: str
+) -> None:
+    """Warn when fields of the model just written are read per well: the
+    numbers written for them are only the stored fallback."""
+    fields = _field_refs.live_fields(conn, kind, name)
+    if not fields:
+        return
+    shown = ", ".join(f"{field} (from {column!r})" for field, column in fields)
+    warnings.warn(
+        f"{method}(name={name!r}): Obsidian reads these fields of the model per well, from "
+        f"a well attribute column: {shown}. The numbers written for them are only the "
+        "stored fallback; each well keeps its own value. The references are unchanged; "
+        "read them with model_field_refs().",
+        ModelFieldRefWarning,
+        stacklevel=4,
+    )
 
 
 def _require_enum(value: object, enum_cls: type[StrEnum], *, method: str, param: str) -> None:
@@ -1159,6 +1593,49 @@ def _require_enum(value: object, enum_cls: type[StrEnum], *, method: str, param:
             f"{method}: {param} must be a {enum_cls.__name__} enum member "
             f"(e.g. {enum_cls.__name__}.{next(iter(enum_cls)).name}), not {value!r}"
         )
+
+
+def _header_fields(fields: Mapping[str, object], *, method: str) -> dict[str, object]:
+    """Header fields under their own names, whichever name each came in under."""
+    named: dict[str, object] = {}
+    for field, value in fields.items():
+        own = HEADER_FIELD_EARLIER_NAMES.get(field, field)
+        if own in named:
+            raise ValidationError(f"{method}: {own!r} was given twice, under two names")
+        named[own] = _header_value(own, value, method=method)
+    return named
+
+
+_HEADER_DATES = frozenset({"spud_date", "completion_date", "first_production_date"})
+_HEADER_NUMBERS = frozenset(
+    {
+        "tvd_ft",
+        "md_ft",
+        "lateral_length_ft",
+        "surface_latitude",
+        "surface_longitude",
+        "bottom_hole_latitude",
+        "bottom_hole_longitude",
+    }
+)
+
+
+def _header_value(field: str, value: object, *, method: str) -> object:
+    """A header value the readers, and Obsidian, can read back. A date field
+    takes a date (or ISO date text) and a number field a finite number; either
+    takes None to clear it."""
+    if value is None:
+        return None
+    if field in _HEADER_DATES:
+        parsed = parse_date(value) if isinstance(value, str) else value
+        if isinstance(parsed, bool) or not isinstance(parsed, date):
+            raise ValidationError(
+                f"{method}: {field} must be a date (or 'YYYY-MM-DD' text); got {value!r}"
+            )
+        return _as_date(parsed)
+    if field in _HEADER_NUMBERS:
+        require_number(value, field=field, method=method)
+    return value
 
 
 def _main_values(prop_id: str, fields: Mapping[str, object], *, method: str) -> tuple[object, ...]:
@@ -1233,7 +1710,7 @@ def _kind_model_type(
         raise ValidationError(f"{method}: DATE_BASED segments require effective_date")
     if age_months is not None:
         raise ValidationError(f"{method}: DATE_BASED segments reject age_months")
-    return f"DATEBASED({effective_date.isoformat()})"
+    return f"DATEBASED({_as_date(effective_date).isoformat()})"
 
 
 def _well_attribute_columns(conn: sqlite3.Connection) -> set[str]:
@@ -1363,7 +1840,7 @@ def _db_value(value: object) -> object:
     if isinstance(value, StrEnum):
         return value.value
     if isinstance(value, date):
-        return value.isoformat()
+        return _as_date(value).isoformat()
     return value
 
 
@@ -1408,6 +1885,7 @@ def _delete_synthetic_model_set(conn: sqlite3.Connection, model_name: str) -> No
             f"DELETE FROM {quote_identifier(table)} WHERE {quote_identifier(name_column)} = ?",
             (model_name,),
         )
+    _field_refs.delete_for_model_name(conn, model_name)
 
 
 def _copy_synthetic_models_for_well(
@@ -1458,7 +1936,7 @@ def _copy_synthetic_model_assignments(
     to_model_name: str,
 ) -> None:
     updated_columns: list[str] = []
-    for _model_type, table, name_column, well_models_column in _SYNTHETIC_MODEL_SPECS:
+    for model_type, table, name_column, well_models_column in _SYNTHETIC_MODEL_SPECS:
         if str(row[well_models_column] or "") != from_model_name:
             continue
         copied = _copy_named_model_rows(
@@ -1469,6 +1947,7 @@ def _copy_synthetic_model_assignments(
             to_model_name=to_model_name,
         )
         if copied:
+            _field_refs.copy_for_model(conn, model_type, from_model_name, to_model_name)
             updated_columns.append(well_models_column)
     if not updated_columns:
         return
@@ -1600,9 +2079,7 @@ def _ensure_well_attributes_table(conn: sqlite3.Connection) -> None:
     if _table_exists(conn, "WellAttributes"):
         return
     conn.execute('CREATE TABLE "WellAttributes" (prop_id TEXT NOT NULL)')
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_WellAttributes ON WellAttributes (prop_id)"
-    )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_WellAttributes ON WellAttributes (prop_id)")
     conn.executemany(
         "INSERT INTO WellAttributes (prop_id) VALUES (?)",
         [(prop_id,) for prop_id in sorted(_all_prop_ids(conn))],

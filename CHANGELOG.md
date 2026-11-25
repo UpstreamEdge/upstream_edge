@@ -3,6 +3,24 @@
 All notable changes to `upstream-edge` are documented in this file.
 
 
+## 1.3.0
+- Writes now show in Obsidian's change history.
+  `Database.open(path, user="...")` names who; `change_log=False` turns it off
+- New `read_only=True` for scripts that only read, and `snapshot()` to save a
+  restore point Obsidian lists as a version
+- New readers `run_settings()`, `type_curves()` and `model_field_refs()`, and
+  `set_run_settings(name, effective_date=...)`
+- `forecasts()` also returns the stored monthly volumes of a saved Spatial
+  Forecasting run, as rows with `monthly_volumes`; check `row.kind`
+- Econ model fields linked to a well attribute stay linked through model,
+  well and attribute edits
+- Clearer field names: `spud_date`, `completion_date`,
+  `first_production_date`, `bottom_hole_latitude`, `bottom_hole_longitude`,
+  `expense_model`, `ad_valorem_tax`. The old names still work in code;
+  DataFrame columns carry the new ones
+- Writers refuse input Obsidian could not read back: rates and costs that are
+  not numbers, dates that are not dates, well ids over 16 bytes
+
 ## 1.2.1
 - Fix `add_well` and other well writers on databases missing newer tables
 - New `MissingTableError` for a call that needs a table the database does not

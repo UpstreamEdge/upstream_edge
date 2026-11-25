@@ -101,18 +101,26 @@ Everything lives on the `Database` class.
 ### Opening, closing, transactions
 
 ```python
-Database.open(path: str | Path) -> Database
+Database.open(path: str | Path, *, read_only: bool = False,
+              change_log: bool = True, user: str | None = None) -> Database
 db.close() -> None
 with Database.open(path) as db: ...
 db.path -> Path
+db.read_only -> bool
 db.transaction() -> ContextManager[None]
+db.snapshot() -> Path
 ```
 
-Opening gives you read/write access. The path must be an existing database — `Database.open` raises `FileNotFoundError` rather than creating an empty file. Reads share the file with Obsidian normally. Write transactions raise `DatabaseLockedError` if Obsidian (or another process) is mid-write. Writers called outside a transaction get one implicitly; wrap multi-row work explicitly.
+Opening gives you read/write access. The path must be an existing database — `Database.open` raises `FileNotFoundError` rather than creating an empty file. Reads share the file with Obsidian normally. A write raises `DatabaseLockedError`, and writes nothing, if another program has the file busy at that moment (Obsidian reading or saving it, another script); wait and retry. Writers called outside a transaction get one implicitly; wrap multi-row work explicitly.
+
+- **`read_only=True`** opens the file for reading only. Every writer raises `ReadOnlyDatabaseError`, and the connection itself cannot change or write-lock the file. Use it for any script that only reads, above all while Obsidian has the file open.
+- **`change_log`** and **`user`** control what a write records about itself; see [What a write records](#what-a-write-records).
+- **`snapshot()`** saves a restore point, worth taking once before a bulk change that is hard to undo. Each call saves a full copy, so it is not something to call before every write. It writes a copy of the file as it is now into the `_Archive` folder beside it, named for the file and the minute (`Field_20261124_1530.obsdb`), which is where Obsidian's own *Archive Current DB* button puts one, so Database mode lists it as a version to open or branch from. The database then records the copy as the version it descends from, as Obsidian does. It returns the copy's path. It needs SQLite 3.27 or later, which every current Python has. It cannot run inside a transaction or on a read-only database, and if the copy cannot be recorded (another process holds the write lock) no copy is left behind.
+- **Versions do not have to match.** The library does not check which Obsidian saved a file, and it names every column it writes. A column a newer Obsidian added is left alone on every row the library does not replace, and `copy_well` carries it along. A whole-replace writer (`set_forecast`, `set_price_model` and the like) writes fresh rows, so such a column is empty on the rows it replaced.
 
 ### Readers
 
-Most readers are collection readers: they take optional filters (positional or keyword), and omitting them — or passing `None` — returns every row. The single-item lookups (`well`, `well_by_api`, `well_attributes`) instead take a required identifier and return one result or `None`.
+Most readers are collection readers: they take optional filters (positional or keyword), and omitting them — or passing `None` — returns every row. The single-item lookups instead take a required identifier: `well` and `well_by_api` return one well or `None`, and `well_attributes` returns one well's attributes or raises `WellNotFoundError`.
 
 **Wells**
 
@@ -133,7 +141,26 @@ db.production_daily(prop_id: str | None = None) -> list[DailyRow]
 
 ```python
 db.forecasts(prop_id: str | None = None, model: str | None = None) -> list[Forecast]
+db.type_curves(name: str | None = None) -> list[TypeCurve]
 ```
+
+`forecasts()` returns a forecast as one list. A phase's forecast is its rows in order of `start`, and `row.kind` says what each row is:
+
+- `ForecastKind.DECLINE`: an Arps decline segment (`rate_init`, `decline_init`, `b_factor`, `decline_min`).
+- `ForecastKind.TYPE_CURVE`: a segment that follows the saved type curve named in `type_curve`.
+- `ForecastKind.MONTHLY_VOLUMES`: stored monthly volumes. `monthly_volumes` holds one volume per month from `start` (bbl for oil and water, Mcf for gas), and the rate fields are `None`. A saved Spatial Forecasting run writes these ahead of the segments. Obsidian uses them as they are for the months they cover, and the segments carry the forecast on after the last one.
+
+```python
+for row in db.forecasts("PROP_001", model="MAIN"):
+    if row.kind is ForecastKind.MONTHLY_VOLUMES:
+        print(row.phase.value, "stored months from", row.start, sum(row.monthly_volumes))
+    else:
+        print(row.phase.value, "segment from", row.start, row.rate_init)
+```
+
+The library does not write stored monthly volumes, and a `MONTHLY_VOLUMES` row is not a segment: `set_forecast` refuses a segment with no numbers. `set_forecast` on a phase that starts with stored months writes its segments and leaves the stored months as they are. A segment that starts after them is the ordinary case. One that starts earlier warns with `MonthlyVolumesWarning`, because Obsidian starts the phase at the first stored month and a segment has no effect until they end.
+
+`type_curves()` returns the saved type curves, one row per curve and phase; a forecast segment that follows one names it in `type_curve`. A `TypeCurve` builds up from `rate_start` to `rate_init` over `build_up_months`, declines at `decline_bridge` for `bridge_months`, then follows the Arps decline (`decline_init`, `b_factor`, `decline_min`, named as a forecast segment names them). Rates are per day at `normalization_lateral_length_ft`, which is `None` for a curve that is not normalized. `analog_apis` are the wells it was fitted to, and `fit_pxx`, `fit_kind` and `fit_forecasts_from` say how (all `None` where the file does not record it). The library does not write type curves.
 
 **Economic models**
 
@@ -143,7 +170,11 @@ db.expense_models(name: str | None = None) -> list[ExpenseModel]
 db.tax_models(name: str | None = None) -> list[TaxModel]
 db.diff_models(name: str | None = None) -> list[DiffModel]
 db.shrink_yield_models(name: str | None = None) -> list[ShrinkYieldModel]
+db.model_field_refs(kind: ModelKind | None = None,
+                    name: str | None = None) -> list[ModelFieldRef]
 ```
+
+A field of an expense, tax, differential or shrink/yield model can be **read per well**: every well is charged its own value, taken from one of its well attribute columns, and the number stored on the model is only a fallback. Obsidian's model editor sets this up, and an ARIES import does. `model_field_refs()` lists those fields: the model's `kind` and `name`, the `segment` (its place in what the model's reader returns, so `db.expense_models(ref.name)[ref.segment]`), the `field`, and the attribute `column`. Check it before reading a model's numbers as what every well is charged. A tax rate's column holds percentages (4.5 is 4.5%), where the model's own number is a fraction.
 
 **Per-well economic linkage**
 
@@ -161,6 +192,14 @@ db.scenarios(name: str | None = None) -> list[Scenario]
 ```
 
 A `Scenario` row carries the scenario-level models — `forecast_model` and `price_model`. Per-well model links (expense, tax, diff, etc.) live in `well_models`, not here.
+
+**Run settings**
+
+```python
+db.run_settings(name: str | None = None) -> list[RunSettings]
+```
+
+A run settings holds what an economics run is made with; Obsidian's ribbon picks one by name. `RunSettings` carries `effective_date` (the first day of the month economics run from), `cutoff_method` with `cutoff_delay_months`, `abandonment_delay_months`, and the after-tax choices (`after_tax`, `federal_tax_rate_pct`, `tangible_recovery_years`, `idc_method`; the last three are `None` unless `after_tax` is on). Each value is read the way Obsidian reads it, so the answer is what Obsidian runs with. That includes its three presets, `STANDARD`, `LOSSOK` and `STANDARD-AFIT`, whose cutoff and abandonment timing (and, for `STANDARD-AFIT`, tax choices) Obsidian holds to the preset whatever the file says.
 
 **Reservoir and Subsurface**
 
@@ -224,7 +263,7 @@ db.delete_monthly_prod(prop_id: str | None = None, *, confirm: bool = False) -> 
 db.delete_daily_prod(prop_id: str | None = None, *, confirm: bool = False) -> None
 ```
 
-Production writers take a flat list of rows — single-well or multi-well, the library groups by `prop_id` internally. `set_monthly_prod` upserts by `(prop_id, month)`; `set_daily_prod` upserts by `(prop_id, date)`.
+Production writers take a flat list of rows — single-well or multi-well, the library groups by `prop_id` internally. `set_monthly_prod` upserts by `(prop_id, month)`; `set_daily_prod` upserts by `(prop_id, date)`. `set_monthly_prod` also fills a well's spud, completion and first production dates with its earliest production month where they are empty.
 
 **Forecasts**
 
@@ -234,6 +273,8 @@ db.set_forecast(prop_id: str, model: str, phase: Phase,
 db.delete_forecast(prop_id: str | None = None, model: str | None = None,
                    phase: Phase | None = None, *, confirm: bool = False) -> None
 ```
+
+`delete_forecast` deletes a forecast whole: its segments and any stored monthly volumes it starts with. With a `phase` it deletes that phase's segments and clears that phase's stored months, keeping the other phases', as deleting one phase in Obsidian does. Called with no well, it deletes for every well.
 
 **Reservoir and Subsurface**
 
@@ -278,6 +319,8 @@ db.delete_expense_model(name: str, *, confirm: bool = False) -> None
 
 `set_*_model` writes a shared, named model; wells reference it by name through `set_well_models`.
 
+Where a model has fields that are read per well (`model_field_refs()`), the writers keep those references true, by Obsidian's own rules. Writing the model warns with `ModelFieldRefWarning`, because the numbers written for those fields are only the fallback. A write that keeps the number of segments moves each reference with its segment, in order of start; a write that changes the number of segments is refused with `ValidationError`, since a reference then has no segment to belong to. Deleting a model deletes its references. A well's individual models keep theirs through `copy_well`, `delete_well`, and a scenario copy or delete.
+
 **Interest, capex, abandonment**
 
 ```python
@@ -292,7 +335,7 @@ db.delete_capex(prop_id: str | None = None, model: str | None = None,
                 *, confirm: bool = False) -> None
 ```
 
-`set_interest` writes the same schedule to every well in `prop_ids` (single string or list). Interest values are percentages from 0 to 100, e.g. 75.0 for 75%.
+`set_interest` writes the same schedule to every well in `prop_ids` (single string or list). The first time a model name is used, every other well gets a 0% row on it, so that no well is without one. Interest values are percentages from 0 to 100, e.g. 75.0 for 75%.
 
 Every well keeps an abandonment cost for each model, so there is no `delete_abandonment` — call `set_abandonment(prop_id, model, 0.0)` to clear it.
 
@@ -306,7 +349,7 @@ db.set_scenario(name: str, *,
                 price_model: str | None = None) -> None
 
 db.set_well_models(prop_ids: str | list[str], scenario: str, *,
-                   exp_model: str | None = None,
+                   expense_model: str | None = None,
                    capex_model: str | None = None,
                    diff_model: str | None = None,
                    tax_model: str | None = None,
@@ -314,7 +357,15 @@ db.set_well_models(prop_ids: str | list[str], scenario: str, *,
                    interest_model: str | None = None) -> None
 ```
 
-`set_well_models` is a partial update — only kwargs you pass get written. Named-entity references (`exp_model`, `diff_model`, `tax_model`, `shrink_yield_model`) are validated before the transaction opens. Label tags (`capex_model`, `interest_model`) emit a `UserWarning` if no matching rows exist yet — a friendly typo guard.
+`set_well_models` is a partial update — only kwargs you pass get written. Named-entity references (`expense_model`, `diff_model`, `tax_model`, `shrink_yield_model`) are validated before the transaction opens. Label tags (`capex_model`, `interest_model`) emit a `UserWarning` if no matching rows exist yet — a friendly typo guard.
+
+**Run settings**
+
+```python
+db.set_run_settings(name: str, *, effective_date: date | None = None) -> None
+```
+
+Sets a run settings' effective date: the first day of a month, for example `date(2026, 7, 1)`. Each run settings keeps its own. A name the database does not have raises `ModelNotFoundError`. The other choices of a run settings are read-only here.
 
 **Well attributes**
 
@@ -326,8 +377,11 @@ db.set_well_attributes_bulk(updates: list[WellAttributeUpdate]) -> None
 db.add_well_attribute_column(name: str, attr_type: AttributeType,
                              default: str | float | date | None = None) -> None
 db.rename_well_attribute_column(old: str, new: str) -> None
-db.delete_well_attribute_column(name: str, *, confirm: bool) -> None
+db.delete_well_attribute_column(name: str, *, confirm: bool,
+                                detach_model_refs: bool = False) -> None
 ```
+
+An econ model field that reads a column per well (`model_field_refs()`) follows the column through a rename. Deleting such a column is refused with `ValidationError` unless you pass `detach_model_refs=True`, which removes the references with it; those fields then use the number stored on the model.
 
 Adding a column backfills the default for every existing well, and the default
 is stored on the column itself, so wells added later with `add_well` start with
@@ -338,7 +392,7 @@ or empty text.
 
 All row types are immutable.
 
-**Read types:** `Well`, `MonthlyRow`, `DailyRow`, `Forecast`, `PriceModel`, `ExpenseModel`, `TaxModel`, `DiffModel`, `ShrinkYieldModel`, `WellModels`, `Interest`, `Capex`, `Abandonment`, `Scenario`, `SurveyPoint`, `Reservoir`, `Completion`, `Perfs`, `AttributeColumn`.
+**Read types:** `Well`, `MonthlyRow`, `DailyRow`, `Forecast`, `TypeCurve`, `PriceModel`, `ExpenseModel`, `TaxModel`, `DiffModel`, `ShrinkYieldModel`, `ModelFieldRef`, `WellModels`, `Interest`, `Capex`, `Abandonment`, `Scenario`, `RunSettings`, `SurveyPoint`, `Reservoir`, `Completion`, `Perfs`, `AttributeColumn`.
 
 **Write-input types** (body-only — the natural-key columns come from the writer's positional args): `ForecastSegment`, `PriceModelSegment`, `ExpenseModelSegment`, `TaxModelSegment`, `DiffModelSegment`, `InterestSegment`, `CapexItem`, `WellAttributeUpdate`, `SurveyPointInput`, `PerfsInput`.
 
@@ -355,6 +409,11 @@ CapexJobType = DRILLING | COMPLETIONS | FACILITIES | SURFACE_WORK |
                CASING_REPAIR | OTHER
 DiffType      = DOLLAR | FRACTION
 AttributeType = TEXT | NUMERIC | DATE
+ForecastKind  = DECLINE | TYPE_CURVE | MONTHLY_VOLUMES
+ModelKind     = PRICE | EXPENSE | TAX | DIFF | SHRINK_YIELD
+CutoffMethod  = ECON_LIMIT | ECON_LIMIT_DELAY | LAST_POSITIVE | LOSS_OK
+IdcMethod     = EXPENSE_IMMEDIATELY | AMORTIZE_60_MONTHS
+TypeCurveFitKind = AUTO | CUSTOM
 ```
 
 Expense and tax model segments carry a `kind` plus the field that kind needs:
@@ -380,6 +439,7 @@ All inherit from `ObsidianDbError`.
 | Exception | When |
 |---|---|
 | `DatabaseLockedError` | Another process holds the SQLite write lock during a write transaction. |
+| `ReadOnlyDatabaseError` | A write on a database opened with `read_only=True`. |
 | `DataIntegrityError` | The database contains data the library can't interpret (e.g. missing column). |
 | `MissingTableError` | A `DataIntegrityError`: the database has no table the call needs, usually because it predates that table (see [Older databases](#older-databases)). Carries `.table`. |
 | `WellNotFoundError` | A PropID you referenced doesn't exist. Carries `.prop_id`. |
@@ -390,16 +450,37 @@ All inherit from `ObsidianDbError`.
 
 Error messages name the method, the offending input, and the valid alternatives where the API can determine them.
 
+Two warnings (each a `UserWarning`) flag a write that will not do what it looks like: `MonthlyVolumesWarning`, when a segment is written to start inside or before a forecast's stored monthly volumes, and `ModelFieldRefWarning`, when a model is written while one of its fields is read per well.
+
 ### Values and conventions
 
 - **Dates** use `datetime.date`. Monthly fields are keyed to the first of the month.
-- **Percentages** use two conventions: severance/ad-valorem tax rates and `gas_shrink_frac` are fractions in `[0, 1]` (`0.046` for 4.6%); interest `wi_pct` / `nri_pct` run `0`–`100` (`75.0` for 75%). Out-of-range values raise `ValidationError`.
+- **Percentages** use two conventions: severance/ad-valorem tax rates and `gas_shrink_frac` are fractions in `[0, 1]` (`0.046` for 4.6%); interest `wi_pct` / `nri_pct` and a run settings' `federal_tax_rate_pct` run `0`–`100` (`75.0` for 75%). Out-of-range values raise `ValidationError`.
 - **Volumes**: oil in barrels (`bbl`), gas in MSCF, water in barrels. Daily rates use `bopd` / `mcfd` / `bwpd`.
 - **Identifiers**: `PropID` is a plain string; `API10` is exactly ten digits.
 - **Enums** round-trip as their `.value` string.
 - **Empty inputs** to whole-replace writers raise `ValidationError` and point at the corresponding `delete_*` method. Empty inputs to per-key upserts are a silent no-op.
 - **`set_*` is idempotent.** Safe to retry after a hiccup.
 - **Every delete** requires `confirm=True`. The library would rather make you type one extra word than vaporize a quarter's work by accident.
+
+### What a write records
+
+Obsidian keeps a `ChangeLog` table that records *that* something changed: which table, which well, which model, when, and by whom. It never holds old or new values. It is what fills **Forecast Last Changed** and **Changed By** in Obsidian's well table. The library writes the same rows Obsidian writes for its own edits, by the same rules:
+
+- **One row per changed object.** Saving all three phases of a well's forecast model is one row (`Forecast`, the well, the model name). A header edit is one row per field whose value changed (`Main`, the well, the column name). Interests and capital log the well and the model; assignments log the well and the scenario. A named price, expense, tax, differential or shrink/yield model logs its name and no well, and so does a run settings whose effective date moved.
+- **Production, surveys, completions, perfs, attributes and scenarios are not logged.** Obsidian does not log them either.
+- **The rows say the change came from outside Obsidian** (`source` 3), and carry the `user` you passed to `Database.open`. Obsidian writes the sign-in email there; left out, the rows name no one.
+- **They commit with the change.** A transaction that rolls back leaves no row.
+- **A repeat is folded.** A second change to the same object on the same connection within 30 seconds adds no second row.
+- **Deleting a well deletes its rows.**
+
+Every write also sets the file's last-modified time, which Obsidian shows in Database mode.
+
+Obsidian reads the log when it loads a database. If you write while Obsidian has the file open, it picks up the data itself within a second or two, and the Last Changed columns follow the next time the file is loaded.
+
+Pass `change_log=False` to `Database.open` when you load a new database in bulk and a row per well would only be noise. Nothing else changes: the data is written the same way.
+
+A file last opened by an Obsidian from before the log existed has no `ChangeLog` table. It is written exactly as before, without log rows.
 
 ### Older databases
 
@@ -414,6 +495,15 @@ written from Python before Obsidian has loaded it, can be missing some of them.
   with no table has no attribute columns.
 - `delete_well` and `copy_well` skip any of their tables the file does not
   have, `WellModels` included.
+- A file without `ForecastVolumes` has no stored monthly volumes; `forecasts()`
+  returns its segments.
+- A file without `ChangeLog` is written without log rows.
+- A file without `EconModelFieldRefs` has no per-well model fields:
+  `model_field_refs()` returns an empty list, and the writers never create
+  the table.
+- Run settings from before the after-tax columns read with `after_tax` off,
+  and type curves from before the fit columns read with the `fit_*` fields
+  and `saved_by` / `saved_at` as `None`.
 - Any other read or write that needs a missing table raises `MissingTableError`
   and writes nothing. Open the file once in Obsidian, then retry.
 
@@ -432,7 +522,7 @@ The library logs to `logging.getLogger("upstream_edge.obsidian_db")` with a `Nul
 
 ## Cookbook
 
-Worked recipes for the common things people do. Each block stands alone — copy, paste, edit the names, run.
+Worked recipes for the common things people do. The first few show the imports and the `with Database.open(...) as db:` line; the shorter ones after them leave those out.
 
 ### List every well in a database
 
@@ -455,6 +545,29 @@ with Database.open("wells.obsdb") as db:
         db.set_well_header("PROP_999", operator="Mitchell", state="TX", county="Midland")
 ```
 
+### Take a restore point, then move the effective date
+
+```python
+from datetime import date
+from upstream_edge.obsidian_db import Database
+
+with Database.open("wells.obsdb", user="dana@example.com") as db:
+    restore_point = db.snapshot()          # wells_20261124_1530.obsdb in _Archive
+    db.set_run_settings("STANDARD", effective_date=date(2026, 7, 1))
+    print("to undo, open", restore_point.name, "in Obsidian's Database mode")
+```
+
+### Find the model fields that are read per well
+
+```python
+from upstream_edge.obsidian_db import Database
+
+with Database.open("wells.obsdb", read_only=True) as db:
+    for ref in db.model_field_refs():
+        print(f"{ref.kind.value} model {ref.name}: {ref.field} comes from "
+              f"each well's {ref.column!r} attribute")
+```
+
 ### Filter wells and pull first-prod dates
 
 ```python
@@ -464,7 +577,7 @@ with Database.open("wells.obsdb") as db:
     targets = [w for w in db.wells()
                if w.rsv_cat == RsvCat.PUD and w.operator == "Mitchell"]
     for w in targets:
-        print(w.prop_id, w.first_prod)
+        print(w.prop_id, w.first_production_date)
 ```
 
 ### Export monthly production to a DataFrame
@@ -554,7 +667,7 @@ with Database.open("wells.obsdb") as db:
         )
         db.set_well_models(
             ["PROP_001", "PROP_002"], scenario="MAIN",
-            exp_model="STD_OPEX",
+            expense_model="STD_OPEX",
         )
 ```
 
@@ -572,12 +685,12 @@ with Database.open("wells.obsdb") as db:
             TaxModelSegment(
                 kind=TaxModelKind.AGE_BASED, age_months=18,
                 sev_tax_oil=0.046, sev_tax_gas=0.075,
-                sev_tax_ngl=0.046, ad_valorum_tax=0.025,
+                sev_tax_ngl=0.046, ad_valorem_tax=0.025,
             ),
             TaxModelSegment(
                 kind=TaxModelKind.SIMPLE,
                 sev_tax_oil=0.046, sev_tax_gas=0.075,
-                sev_tax_ngl=0.046, ad_valorum_tax=0.025,
+                sev_tax_ngl=0.046, ad_valorem_tax=0.025,
             ),
         ],
     )
